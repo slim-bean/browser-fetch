@@ -6,4 +6,4 @@ resources:
   - service.yaml
 images:
   - name: registry.edjusted.com/browser-fetch/browser-fetch
-    newTag: 20260911-83660f5
+    newTag: 20260911-2064016
