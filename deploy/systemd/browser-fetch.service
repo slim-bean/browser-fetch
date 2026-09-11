@@ -1,0 +1,44 @@
+# User service: systemctl --user enable --now browser-fetch
+#
+# Runs as your user so it shares the desktop session with Chrome. Chrome itself
+# is started separately (deploy/chrome-launch.sh), either from your session's
+# autostart or its own user unit, so you can see and interact with it.
+
+[Unit]
+Description=pi browser gateway (renders pages via a real Chrome)
+Documentation=https://github.com/slim-bean/browser-fetch
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/browser-fetch
+Restart=on-failure
+RestartSec=3s
+
+# Listen on the VM's private interface so the host can reach it; never 0.0.0.0
+# on an untrusted network. The token is mandatory.
+Environment=BROWSER_FETCH_ADDR=0.0.0.0:8377
+Environment=BROWSER_FETCH_CHROME_URL=http://127.0.0.1:9222
+Environment=BROWSER_FETCH_MAX_TABS=4
+Environment=BROWSER_FETCH_HOST_GAP=1500ms
+Environment=BROWSER_FETCH_HOST_JITTER=750ms
+Environment=BROWSER_FETCH_LOG_FORMAT=json
+# Hold unsolved challenges so you can click them in the visible window.
+Environment=BROWSER_FETCH_ASSIST_TIMEOUT=90s
+# Put BROWSER_FETCH_TOKEN=... in this file, mode 0600.
+EnvironmentFile=%h/.config/browser-fetch.env
+
+# Modest hardening. The process needs network and the DevTools socket only.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+MemoryMax=512M
+
+[Install]
+WantedBy=graphical-session.target
