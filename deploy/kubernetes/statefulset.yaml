@@ -1,0 +1,130 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: browser-fetch
+  labels:
+    app: browser-fetch
+spec:
+  # Exactly one replica, always. Chrome locks its user-data-dir, so a second
+  # pod sharing the RWO PVC would either fail to start or corrupt the profile.
+  replicas: 1
+  serviceName: browser-fetch
+  selector:
+    matchLabels:
+      app: browser-fetch
+  # Never run two pods at once during a rollout, for the same reason.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: browser-fetch
+    spec:
+      # Google ships Chrome for amd64 only; this cluster has arm64 Pis too.
+      nodeSelector:
+        kubernetes.io/arch: amd64
+      securityContext:
+        # supervisord starts as root to prepare /tmp/.X11-unix and chown the
+        # PVC, then drops every program to uid 1000. Chrome refuses to run as
+        # root with its sandbox on, and we want the sandbox.
+        fsGroup: 1000
+        # Chrome's own sandbox needs unprivileged user namespaces (CLONE_NEWUSER),
+        # which containerd's default seccomp profile blocks -- Chrome dies with
+        # "Zygote process exited prematurely". Two ways out:
+        #   1. Unconfined seccomp + Chrome's sandbox intact  (this)
+        #   2. RuntimeDefault seccomp + CHROME_NO_SANDBOX=true
+        # (1) is what the common desktop-in-a-container images do, and keeps the
+        # boundary that actually contains hostile page content. Revisit if this
+        # pod ever holds credentials worth more than the browser profile.
+        seccompProfile:
+          type: Unconfined
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: browser-fetch
+          image: registry.edjusted.com/browser-fetch/browser-fetch:dev
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8377
+            - name: vnc
+              containerPort: 5900
+          env:
+            - name: BROWSER_FETCH_ADDR
+              value: "0.0.0.0:8377"
+            - name: BROWSER_FETCH_CHROME_URL
+              value: "http://127.0.0.1:9222"
+            - name: BROWSER_FETCH_LOG_FORMAT
+              value: "json"
+            - name: BROWSER_FETCH_MAX_TABS
+              value: "4"
+            - name: BROWSER_FETCH_HOST_GAP
+              value: "1500ms"
+            - name: BROWSER_FETCH_HOST_JITTER
+              value: "750ms"
+            # Hold an unsolved challenge open so a human can clear it over VNC.
+            - name: BROWSER_FETCH_ASSIST_TIMEOUT
+              value: "120s"
+            - name: SCREEN_GEOMETRY
+              value: "1920x1080x24"
+            # Keep the browser's timezone consistent with the egress IP.
+            - name: TZ
+              value: "America/New_York"
+            - name: BROWSER_FETCH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-fetch
+                  key: token
+            - name: VNC_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: browser-fetch
+                  key: vnc-password
+          volumeMounts:
+            - name: profile
+              mountPath: /profile
+            # Kubernetes gives /dev/shm 64Mi and has no --shm-size; Chrome's
+            # renderers crash without more. This counts against the memory
+            # limit below.
+            - name: dshm
+              mountPath: /dev/shm
+          resources:
+            requests:
+              cpu: 500m
+              memory: 2Gi
+            limits:
+              cpu: "2"
+              memory: 5Gi
+          # Readiness follows Chrome: /healthz is 503 while CDP is unreachable,
+          # so the Service drops the pod rather than serving failing fetches.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
+          # Liveness is deliberately dumber: a Chrome blip should not restart
+          # the pod, since supervisord already restarts Chrome itself.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            failureThreshold: 5
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: profile
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # local-path pins the pod to one node. Switch to truenas-iscsi if you
+        # want the profile (and its logins) to follow the pod across nodes.
+        storageClassName: local-path
+        resources:
+          requests:
+            storage: 10Gi

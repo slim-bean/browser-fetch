@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: browser-fetch
+  labels:
+    app: browser-fetch
+spec:
+  type: ClusterIP
+  selector:
+    app: browser-fetch
+  ports:
+    - name: http
+      port: 8377
+      targetPort: http
+    - name: vnc
+      port: 5900
+      targetPort: vnc
+---
+# Headless companion: guacamole connects to a stable per-pod DNS name, and the
+# VNC session survives the main Service's readiness gating (which follows
+# Chrome, not the display).
+apiVersion: v1
+kind: Service
+metadata:
+  name: browser-fetch-headless
+  labels:
+    app: browser-fetch
+spec:
+  type: ClusterIP
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: browser-fetch
+  ports:
+    - name: vnc
+      port: 5900
+      targetPort: vnc
+    - name: http
+      port: 8377
+      targetPort: http
