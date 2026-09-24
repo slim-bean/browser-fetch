@@ -453,6 +453,8 @@ func (m *Manager) dispatch(ctx context.Context, s *Session, tab Tab, a Action) (
 		return dispatchScreenshot(ctx, v)
 	case ContentAction:
 		return tab.Read(ctx)
+	case DownloadAction:
+		return dispatchDownload(ctx, tab, v)
 	case AssertAction:
 		return dispatchAssert(ctx, tab, v)
 	default:

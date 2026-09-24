@@ -187,6 +187,10 @@ func decodeAction(raw json.RawMessage) (session.Action, error) {
 		var a session.AssertAction
 		err := dec.Decode(&a)
 		return a, wrapDecode(err)
+	case "download":
+		var a session.DownloadAction
+		err := dec.Decode(&a)
+		return a, wrapDecode(err)
 	default:
 		return nil, errors.New("unknown action kind " + env.Kind)
 	}
