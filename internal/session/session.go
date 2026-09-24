@@ -52,6 +52,10 @@ type Options struct {
 	AssertTTL time.Duration
 	// MaxLog caps the per-session evidence log.
 	MaxLog int
+	// AllowNavigate, when set, must return nil for URLs the session may
+	// navigate to. It is a tripwire on the navigate primitive, not a sandbox:
+	// clicking a link can still navigate the tab.
+	AllowNavigate func(url string) error
 }
 
 func DefaultOptions() Options {
@@ -433,6 +437,11 @@ func actionDetail(a Action) string {
 func (m *Manager) dispatch(ctx context.Context, s *Session, tab Tab, a Action) (any, error) {
 	switch v := a.(type) {
 	case NavigateAction:
+		if m.opts.AllowNavigate != nil {
+			if err := m.opts.AllowNavigate(v.URL); err != nil {
+				return nil, err
+			}
+		}
 		return nil, runOn(ctx, chromedp.Navigate(v.URL))
 	case ClickAction:
 		return nil, runOn(ctx, chromedp.Click(v.Selector, chromedp.ByQueryAll, chromedp.NodeVisible))

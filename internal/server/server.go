@@ -15,10 +15,12 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/http/pprof"
+	neturl "net/url"
 	"os"
 	"strings"
 	"time"
@@ -76,6 +78,7 @@ func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
 		ActionTimeout: cfg.ActionTimeout,
 		AssertTTL:     cfg.AssertTTL,
 		MaxLog:        200,
+		AllowNavigate: allowHosts(cfg.AllowHosts),
 	})
 	go s.sessionsReaper()
 	s.met = metrics.New(metrics.Sources{
@@ -124,11 +127,11 @@ func (s *Server) Handler() http.Handler {
 			"capabilities": map[string]bool{"cdp": s.cfg.EnableCDP, "history": len(s.cfg.HistoryCommand) > 0},
 		})
 	}))
-	mux.Handle("POST /session/open", s.route("session_open", true, s.handleSessionOpen))
-	mux.Handle("POST /session/action", s.route("session_action", true, s.handleSessionAction))
-	mux.Handle("POST /session/close", s.route("session_close", true, s.handleSessionClose))
-	mux.Handle("GET /sessions", s.route("sessions", true, s.handleSessionList))
-	mux.Handle("GET /session/log", s.route("session_log", true, s.handleSessionLog))
+	mux.Handle("POST /session/open", s.routeDriver("session_open", s.handleSessionOpen))
+	mux.Handle("POST /session/action", s.routeDriver("session_action", s.handleSessionAction))
+	mux.Handle("POST /session/close", s.routeDriver("session_close", s.handleSessionClose))
+	mux.Handle("GET /sessions", s.routeDriver("sessions", s.handleSessionList))
+	mux.Handle("GET /session/log", s.routeDriver("session_log", s.handleSessionLog))
 	mux.Handle("GET /metrics", s.route("metrics", s.cfg.MetricsAuth, promhttp.HandlerFor(
 		s.met.Registry, promhttp.HandlerOpts{Registry: s.met.Registry},
 	).ServeHTTP))
@@ -152,6 +155,24 @@ func (s *Server) Handler() http.Handler {
 	}))
 
 	return mux
+}
+
+// routeDriver wraps a handler that requires the driver token class (driver
+// or full; readers and anonymous callers are rejected).
+func (s *Server) routeDriver(name string, h http.HandlerFunc) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		class := s.tokenClass(r)
+		if class != classDriver && class != classFull {
+			log := s.log.With("route", name, "remote", r.RemoteAddr)
+			log.Warn("session route requires the driver token")
+			writeJSON(w, http.StatusUnauthorized, errorBody{
+				Error: "session routes require the driver token",
+				Code:  "unauthorized",
+			})
+			return
+		}
+		s.route(name, true, h).ServeHTTP(w, r)
+	})
 }
 
 // route wraps a handler with request-id, logging, metrics and optional auth.
@@ -185,16 +206,71 @@ func (s *Server) route(name string, needAuth bool, h http.HandlerFunc) http.Hand
 }
 
 func (s *Server) authorized(r *http.Request) bool {
+	return s.tokenClass(r) != classNone
+}
+
+// tokenClass identifies which bearer token the caller presented.
+type tokenClass int
+
+const (
+	classNone   tokenClass = iota
+	classReader            // ReaderToken: /fetch only, never sessions
+	classDriver            // DriverToken: sessions + fetch
+	classFull              // Token: everything
+)
+
+func (s *Server) tokenClass(r *http.Request) tokenClass {
 	if s.cfg.Token == "" {
-		return s.cfg.AllowNoToken
+		if s.cfg.AllowNoToken {
+			return classFull
+		}
+		return classNone
 	}
 	const prefix = "Bearer "
 	h := r.Header.Get("Authorization")
 	if !strings.HasPrefix(h, prefix) || len(h) <= len(prefix) {
-		return false
+		return classNone
 	}
-	got, want := h[len(prefix):], s.cfg.Token
-	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+	got := h[len(prefix):]
+	if subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.Token)) == 1 {
+		return classFull
+	}
+	if s.cfg.DriverToken != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.DriverToken)) == 1 {
+		return classDriver
+	}
+	if s.cfg.ReaderToken != "" && subtle.ConstantTimeCompare([]byte(got), []byte(s.cfg.ReaderToken)) == 1 {
+		return classReader
+	}
+	return classNone
+}
+
+// allowHosts builds the session navigate tripwire from the allowlist. Exact
+// hostnames and .domain wildcards, case-insensitive; an empty list allows
+// whatever the URL guard already allows.
+func allowHosts(list []string) func(string) error {
+	if len(list) == 0 {
+		return nil
+	}
+	allowed := make([]string, len(list))
+	copy(allowed, list)
+	return func(rawURL string) error {
+		host := strings.ToLower(rawURL)
+		if u, err := neturl.Parse(rawURL); err == nil && u.Hostname() != "" {
+			host = strings.ToLower(u.Hostname())
+		}
+		for _, entry := range allowed {
+			if strings.HasPrefix(entry, ".") {
+				if host == strings.TrimPrefix(entry, ".") || strings.HasSuffix(host, entry) {
+					return nil
+				}
+				continue
+			}
+			if host == entry {
+				return nil
+			}
+		}
+		return fmt.Errorf("host %q is not on the session allowlist", host)
+	}
 }
 
 // browserSessionTab adapts a leased pool tab to the session.Tab interface.
