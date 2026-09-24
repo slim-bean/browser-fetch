@@ -32,6 +32,7 @@ import (
 	"github.com/slim-bean/browser-fetch/internal/metrics"
 	"github.com/slim-bean/browser-fetch/internal/reqlog"
 	"github.com/slim-bean/browser-fetch/internal/scheduler"
+	"github.com/slim-bean/browser-fetch/internal/session"
 	"github.com/slim-bean/browser-fetch/internal/urlguard"
 )
 
@@ -43,6 +44,7 @@ type Server struct {
 	guard        *urlguard.Guard
 	ring         *reqlog.Ring
 	met          *metrics.Metrics
+	sessions     *session.Manager
 	start        time.Time
 	historySlots chan struct{}
 }
@@ -62,6 +64,20 @@ func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
 			Jitter:   cfg.HostJitter,
 		}),
 	}
+	s.sessions = session.New(log, func(ctx context.Context) (session.Tab, func(), error) {
+		tab, release, err := mgr.Acquire(ctx)
+		if err != nil {
+			return nil, nil, err
+		}
+		return browserSessionTab{tab}, release, nil
+	}, session.Options{
+		MaxSessions:   cfg.MaxSessions,
+		MaxIdle:       cfg.SessionIdle,
+		ActionTimeout: cfg.ActionTimeout,
+		AssertTTL:     cfg.AssertTTL,
+		MaxLog:        200,
+	})
+	go s.sessionsReaper()
 	s.met = metrics.New(metrics.Sources{
 		TabsBusy:    func() float64 { return float64(mgr.Health().Tabs.Busy) },
 		TabsIdle:    func() float64 { return float64(mgr.Health().Tabs.Idle) },
@@ -108,6 +124,11 @@ func (s *Server) Handler() http.Handler {
 			"capabilities": map[string]bool{"cdp": s.cfg.EnableCDP, "history": len(s.cfg.HistoryCommand) > 0},
 		})
 	}))
+	mux.Handle("POST /session/open", s.route("session_open", true, s.handleSessionOpen))
+	mux.Handle("POST /session/action", s.route("session_action", true, s.handleSessionAction))
+	mux.Handle("POST /session/close", s.route("session_close", true, s.handleSessionClose))
+	mux.Handle("GET /sessions", s.route("sessions", true, s.handleSessionList))
+	mux.Handle("GET /session/log", s.route("session_log", true, s.handleSessionLog))
 	mux.Handle("GET /metrics", s.route("metrics", s.cfg.MetricsAuth, promhttp.HandlerFor(
 		s.met.Registry, promhttp.HandlerOpts{Registry: s.met.Registry},
 	).ServeHTTP))
@@ -174,6 +195,30 @@ func (s *Server) authorized(r *http.Request) bool {
 	}
 	got, want := h[len(prefix):], s.cfg.Token
 	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// browserSessionTab adapts a leased pool tab to the session.Tab interface.
+type browserSessionTab struct {
+	t *browser.SessionTab
+}
+
+func (b browserSessionTab) Ctx() context.Context { return b.t.Ctx() }
+
+func (b browserSessionTab) Read(ctx context.Context) (session.Snapshot, error) {
+	snap, err := b.t.Read(ctx)
+	if err != nil {
+		return session.Snapshot{}, err
+	}
+	return session.Snapshot{URL: snap.URL, Title: snap.Title, HTML: snap.HTML}, nil
+}
+
+// sessionsReaper closes sessions idle past their TTL so pooled tabs return.
+func (s *Server) sessionsReaper() {
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+	for range t.C {
+		s.sessions.Reap()
+	}
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

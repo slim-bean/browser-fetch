@@ -74,6 +74,15 @@ type Config struct {
 	// MetricsAuth requires the bearer token on /metrics too.
 	MetricsAuth bool
 
+	// MaxSessions caps concurrent L1 sessions (one tab each).
+	MaxSessions int
+	// SessionIdle evicts a session idle longer than this.
+	SessionIdle time.Duration
+	// ActionTimeout bounds one session action.
+	ActionTimeout time.Duration
+	// AssertTTL is how long a passing assertion stays fresh for typing.
+	AssertTTL time.Duration
+
 	LogFormat string // text|json
 	LogLevel  string // debug|info|warn|error
 }
@@ -93,6 +102,10 @@ func Default() Config {
 		ChallengeRetryDelay: 2 * time.Second,
 		Debug:               true,
 		DebugRing:           200,
+		MaxSessions:         2,
+		SessionIdle:         10 * time.Minute,
+		ActionTimeout:       30 * time.Second,
+		AssertTTL:           30 * time.Second,
 		LogFormat:           "text",
 		LogLevel:            "info",
 	}
@@ -125,6 +138,10 @@ func Load(args []string) (Config, error) {
 		envBool("BROWSER_FETCH_ALLOW_PRIVATE", &c.AllowPrivate),
 		envBool("BROWSER_FETCH_METRICS_AUTH", &c.MetricsAuth),
 		envBool("BROWSER_FETCH_ALLOW_NO_TOKEN", &c.AllowNoToken),
+		envInt("BROWSER_FETCH_MAX_SESSIONS", &c.MaxSessions),
+		envDur("BROWSER_FETCH_SESSION_IDLE", &c.SessionIdle),
+		envDur("BROWSER_FETCH_ACTION_TIMEOUT", &c.ActionTimeout),
+		envDur("BROWSER_FETCH_ASSERT_TTL", &c.AssertTTL),
 	); err != nil {
 		return c, err
 	}
@@ -157,6 +174,10 @@ func Load(args []string) (Config, error) {
 	fs.BoolVar(&c.Debug, "debug", c.Debug, "enable /debug and /debug/pprof")
 	fs.IntVar(&c.DebugRing, "debug-ring", c.DebugRing, "recent requests retained for /debug")
 	fs.BoolVar(&c.MetricsAuth, "metrics-auth", c.MetricsAuth, "require token on /metrics")
+	fs.IntVar(&c.MaxSessions, "max-sessions", c.MaxSessions, "max concurrent L1 sessions")
+	fs.DurationVar(&c.SessionIdle, "session-idle", c.SessionIdle, "evict sessions idle longer than this")
+	fs.DurationVar(&c.ActionTimeout, "action-timeout", c.ActionTimeout, "deadline for one session action")
+	fs.DurationVar(&c.AssertTTL, "assert-ttl", c.AssertTTL, "how long a passing assertion stays fresh for typing")
 	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "text|json")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "debug|info|warn|error")
 	if err := fs.Parse(args); err != nil {
@@ -198,6 +219,9 @@ func (c Config) validate() error {
 	}
 	if !strings.HasPrefix(c.ChromeURL, "http://") && !strings.HasPrefix(c.ChromeURL, "ws://") {
 		return fmt.Errorf("chrome-url must start with http:// or ws://, got %q", c.ChromeURL)
+	}
+	if c.MaxSessions < 1 {
+		return errors.New("max-sessions must be >= 1")
 	}
 	return nil
 }
