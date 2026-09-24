@@ -97,6 +97,38 @@ For a persistent setup see `deploy/systemd/browser-fetch.service`.
 | `GET /debug` | yes | live HTML dashboard; `?format=json` for machines |
 | `GET /debug/pprof/…` | yes | Go profiling |
 | `GET /metrics` | optional | Prometheus (`-metrics-auth` to require the token) |
+| `POST /session/open` | driver | `{"host":…}` → `{session_id,…}`; leases a tab that holds page state |
+| `POST /session/action` | driver | `{"session_id":…, "action":{kind,…}}` → action result; see below |
+| `POST /session/close` | driver | `{"session_id":…}` — parks the tab and frees the lease |
+| `GET /sessions` | driver | live sessions with idle time and credential-typing eligibility |
+| `GET /session/log?session_id=…` | driver | the session's per-action evidence log |
+
+### Session actions
+
+Actions are a typed vocabulary — **no caller-supplied JavaScript is ever
+evaluated**. `kind` selects the action; unknown fields are rejected.
+
+| kind | fields | notes |
+|---|---|---|
+| `navigate` | `url` | gated by `-allow-hosts` when set, plus the usual URL guard |
+| `click` | `selector` | first visible match |
+| `type` | `text`, `field`, `submit` | `field=password` refused unless an exact `assert` passed within `-assert-ttl` (default 30s) |
+| `wait` | `selector` or `url_regexp`, `timeout_ms` | blocks until visible/matched |
+| `screenshot` | `full_page` | PNG, base64; result includes `sha256` |
+| `content` | — | current `{url,title,html}` snapshot |
+| `download` | `click_selector`, `filename_regexp`, `timeout_ms`, `max_bytes` | captures the file via CDP, returns base64 + `sha256` |
+| `assert` | `kind` (`url`,`title`,`landmark`,`landmarks`), `pattern`, `landmarks`, `min_match` | layered screen identity; only exact `url`/`title` matches enable credential typing |
+
+Every action is recorded in the session's evidence log with outcome and
+duration; password values are recorded as length only, never text.
+
+### Token classes
+
+The root token ( `-token` ) grants everything. Two optional extra tokens
+narrow what a caller can do:
+
+- `-driver-token` — sessions and fetch. This is what the finance flow engine uses.
+- `-reader-token` — `/fetch` only; can never open a session.
 
 Error responses carry a `code`: `challenge`, `nav_error`, `rejected_url`,
 `timeout`, `bad_request`, `chrome_unavailable`. Clients should treat the first

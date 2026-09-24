@@ -87,6 +87,18 @@ spec:
                 secretKeyRef:
                   name: browser-fetch
                   key: token
+            - name: BROWSER_FETCH_DRIVER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-fetch
+                  key: driver-token
+                  optional: true
+            - name: BROWSER_FETCH_READER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-fetch
+                  key: reader-token
+                  optional: true
             - name: VNC_PASSWORD
               valueFrom:
                 secretKeyRef:
