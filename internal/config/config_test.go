@@ -22,7 +22,7 @@ func TestBrowserAPIsRequireCredentialsAndHTTPDiscovery(t *testing.T) {
 	}
 	c.EnableCDP = false
 	c.Token = ""
-	c.HistoryCommand = []string{"node", "history.ts"}
+	c.HistoryRoot = "/profile/chrome"
 	if err := c.validate(); err == nil {
 		t.Fatal("history accepted without token")
 	}

@@ -35,15 +35,16 @@ types, hence the flags):
 
 ```bash
 docker buildx build --builder <container-driver-builder> --platform linux/amd64 \
-  --build-arg PI_BROWSER_REF=<pi-browser-commit-with-history-helper> \
   --provenance=false --sbom=false \
   --output "type=image,name=registry.edjusted.com/browser-fetch/browser-fetch:$TAG,push=true,oci-mediatypes=true" .
 ```
 
-The history helper uses the pi-browser implementation bundled at `PI_BROWSER_REF`.
-For local, uncommitted source, run `scripts/stage-history.sh ../pi-browser` and use
-`--build-arg PI_BROWSER_SOURCE=local` instead. Build/publish a new image before
-applying the updated manifest; an older image does not have these APIs/helper.
+History is native Go; image builds need only this repository and its Go modules.
+No `PI_BROWSER_REF`, Node runtime, or staged pi-browser source is required.
+Build/publish the updated image **and** apply the updated manifest. Remove old
+`BROWSER_FETCH_HISTORY_COMMAND` env settings (startup rejects them) and update
+clients to history protocol v2. The entrypoint defaults `BROWSER_FETCH_HISTORY_ROOT`
+to `CHROME_PROFILE`; an explicit empty value disables it.
 Use a new tag/digest: the template uses `IfNotPresent`, so reusing the same `dev`
 tag can retain an old cached image.
 
@@ -71,8 +72,10 @@ the agent image. Configure `.pi/assistant.json`:
 }
 ```
 
-Provide the gateway Secret's token through that environment variable, or use a
-mounted Secret file via `tokenFile`. All agent traffic uses **8377**, including CDP
+Provide the gateway Secret's **root** token through that environment variable, or
+use a mounted Secret file via `tokenFile`. Reader/driver tokens do not grant raw
+CDP, history or runtime inspection; finance drivers keep their restricted session/
+macro surface. All agent traffic uses **8377**, including CDP
 WebSockets and history; do not expose Chrome's raw 9222 port. Kubernetes/supervisord
 owns browser startup. Agent sessions must not start local replacement browsers or
 mount the profile PVC. No Yono egress/NetworkPolicy changes are performed here—allow

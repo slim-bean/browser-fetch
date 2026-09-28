@@ -4,12 +4,9 @@ set -euo pipefail
 
 PROFILE_DIR="${CHROME_PROFILE:-/profile/chrome}"
 CHROME_UID="${CHROME_UID:-1000}"
-# Use the same operator-configured profile for history unless explicit roots were
-# supplied. This is not host-wide discovery and does not require another service.
-if [[ -z "${PI_BROWSER_HISTORY_CHROMIUM_ROOTS:-}" ]]; then
-  export PI_BROWSER_HISTORY_CHROMIUM_ROOTS
-  PI_BROWSER_HISTORY_CHROMIUM_ROOTS="$(node -e 'process.stdout.write(JSON.stringify([{browser:"assistant",dir:process.argv[1]}]))' "$PROFILE_DIR")"
-fi
+# Native history defaults to the same operator-owned Chrome user-data directory.
+# An explicitly empty BROWSER_FETCH_HISTORY_ROOT disables history.
+export BROWSER_FETCH_HISTORY_ROOT="${BROWSER_FETCH_HISTORY_ROOT-$PROFILE_DIR}"
 mkdir -p "$PROFILE_DIR" /profile/vnc /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix || true
 

@@ -60,10 +60,8 @@ spec:
               value: "true"
             - name: BROWSER_FETCH_BACKGROUND_TABS
               value: "true"
-            - name: BROWSER_FETCH_HISTORY_COMMAND
-              value: '["node","/opt/pi-browser/bin/history.ts"]'
-            # History defaults to CHROME_PROFILE. Override
-            # PI_BROWSER_HISTORY_CHROMIUM_ROOTS only for explicit additional roots.
+            # Native history defaults to CHROME_PROFILE in the entrypoint.
+            # Set BROWSER_FETCH_HISTORY_ROOT="" to disable it; no helper/runtime.
             - name: BROWSER_FETCH_LOG_FORMAT
               value: "json"
             - name: BROWSER_FETCH_MAX_TABS

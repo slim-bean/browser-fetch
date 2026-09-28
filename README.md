@@ -45,6 +45,8 @@ default browser context share cookies, so trust earned in one benefits all.
 | `internal/urlguard` | rejects non-HTTP schemes and private/loopback/link-local targets, after DNS resolution |
 | `internal/server` | HTTP API, auth, request logging, `/debug`, metrics |
 | `internal/reqlog` | bounded ring of recent requests for `/debug` |
+| `internal/history` | native, bounded Chromium history records from private database snapshots |
+| `internal/session`, `internal/macro` | typed sessions and approved deterministic macro replay |
 
 ## Deployment options
 
@@ -90,10 +92,10 @@ For a persistent setup see `deploy/systemd/browser-fetch.service`.
 | `GET /fetch?url=…` | yes | same, convenient for `curl` |
 | `GET /healthz` | no | Chrome connectivity, version, tab pool, pending assists |
 | `GET /stats` | yes | scheduler snapshot: queue, per-host cooldowns, totals |
-| `GET /runtime` | yes | service identity + configured `capabilities: {cdp,history}` (no secrets) |
-| `/cdp/…` | yes | optional Chrome HTTP discovery + WebSocket proxy, full browser control |
-| `POST /history/search` | yes | optional pi-browser history query (same parameters as `browser_history`) |
-| `GET /history/sources` | yes | configured remote source ids/labels, not filesystem paths |
+| `GET /runtime` | root | service identity, configured capabilities, `historyProtocol: 2` |
+| `/cdp/…` | root | optional Chrome HTTP discovery + WebSocket proxy, full browser control |
+| `POST /history/query` | root | native, bounded Chromium records selected by structured filters |
+| `GET /history/sources` | root | configured profile ids/labels (protocol v2), not filesystem paths |
 | `GET /debug` | yes | live HTML dashboard; `?format=json` for machines |
 | `GET /debug/pprof/…` | yes | Go profiling |
 | `GET /metrics` | optional | Prometheus (`-metrics-auth` to require the token) |
@@ -110,8 +112,10 @@ For a persistent setup see `deploy/systemd/browser-fetch.service`.
 
 ### Session actions
 
-Actions are a typed vocabulary — **no caller-supplied JavaScript is ever
-evaluated**. `kind` selects the action; unknown fields are rejected.
+Session actions are a typed vocabulary — **no caller-supplied JavaScript is
+evaluated by this API**. `kind` selects the action; unknown fields are rejected.
+The separate root-only CDP proxy is deliberately unrestricted and must not be
+accessible to a restricted finance driver.
 
 | kind | fields | notes |
 |---|---|---|
@@ -149,6 +153,11 @@ narrow what a caller can do:
 - `-driver-token` — sessions and fetch. This is what the finance flow engine uses.
 - `-reader-token` — `/fetch` only; can never open a session.
 
+CDP, history, runtime inspection and authenticated admin/debug routes require the
+root token. Public health/optionally-public metrics are unchanged. Session/macro
+routes retain driver-or-root access. Reader/driver credentials cannot use CDP to
+bypass the typed-action restrictions.
+
 Error responses carry a `code`: `challenge`, `nav_error`, `rejected_url`,
 `timeout`, `bad_request`, `chrome_unavailable`. Clients should treat the first
 three as "the target refused" and the rest as "the gateway is broken" -- pi-search
@@ -167,18 +176,16 @@ Chrome stays on loopback; clients do **not** need a raw CDP port or a profile mo
 
 ```bash
 export BROWSER_FETCH_TOKEN=…
-export PI_BROWSER_HISTORY_CHROMIUM_ROOTS='[{"browser":"assistant","dir":"/profile/chrome"}]'
-export BROWSER_FETCH_HISTORY_COMMAND='["node","/opt/pi-browser/bin/history.ts"]'
-browser-fetch -enable-cdp -background-tabs -addr 0.0.0.0:8377 -chrome-url http://127.0.0.1:9222
+browser-fetch -enable-cdp -background-tabs -history-root=/profile/chrome \
+  -addr 0.0.0.0:8377 -chrome-url http://127.0.0.1:9222
 ```
 
-CDP and history are opt-in for the Go binary, and require a token even with
-`-allow-no-token`. The container includes Node + pi-browser and configures the history
-helper; its entrypoint defaults the history root to `CHROME_PROFILE` (override
-`PI_BROWSER_HISTORY_CHROMIUM_ROOTS` to select other explicit roots). The Kubernetes
-manifest also enables CDP and background worker tabs. The same bearer token authorizes
-all three interfaces. This is intended for your trusted assistant workloads—not
-per-tab/per-action isolation or protection against hostile authorized agents.
+CDP and history are opt-in for the Go binary and require the **root token**, even
+with `-allow-no-token`. Native history uses a pure-Go SQLite driver: no Node runtime,
+pi-browser checkout, helper executable or cross-repository build pin. The container
+entrypoint defaults `BROWSER_FETCH_HISTORY_ROOT` to `CHROME_PROFILE`; an explicit
+empty value disables it. Kubernetes also enables CDP and background worker tabs.
+Root-token assistant access is deliberately broader than driver/reader access.
 
 `/cdp/json/version` and `/cdp/json/list` rewrite `webSocketDebuggerUrl` back through
 the gateway. All HTTP discovery and WebSocket upgrades authenticate. Only fixed
@@ -187,13 +194,12 @@ For TLS termination or a stripped ingress prefix, set e.g.
 `-public-url=https://browser.example/assistant`. Forwarded headers aren't trusted
 implicitly. The proxy handles WebSockets; ensure any outer proxy does too.
 
-The history helper is **pi-browser's own implementation**, called over bounded JSON
-stdin/stdout (no extra listener). It only searches operator-configured Chromium roots,
-never host-wide browser discovery, and accepts query parameters—not paths, SQL or
-commands—from clients. Two helpers may run concurrently; excess requests return 429.
-Queries have a 15-second deadline, 64-KiB input limit and 2-MiB output limit. Missing
-helpers return an explicit error, not a fallback. `/runtime` advertises configuration,
-not proof that a helper's files/data are currently readable.
+History v2 returns normalized records from operator-selected Chromium profile
+snapshots. Clients (including pi-browser) own query syntax, exact-host filtering,
+deduplication, ranking and presentation. No paths, SQL or commands are accepted from
+clients. Limits, snapshot behavior, HTTP examples and migration instructions are in
+[`docs/history.md`](docs/history.md). Old `/history/search` clients receive a clear
+410 upgrade error; old helper configuration is not silently ignored.
 
 CDP intentionally grants more authority than `/fetch`: it can read cookies, execute
 page JavaScript and navigate anywhere Chrome can reach. Fetch URL guards and pacing
@@ -202,20 +208,13 @@ do not apply to raw CDP. Logs observe HTTP requests / WebSocket connection lifet
 endpoint on a trusted network or behind an authenticated TLS boundary. VNC remains an
 optional separate human-access path; all agent traffic uses just the HTTP port.
 
-### Container source dependency
+### Independent builds
 
-Release builds require `--build-arg PI_BROWSER_REF=<commit-containing-bin/history.ts>`.
-The image fetches that pi-browser ref; pin a commit rather than a moving branch.
-For uncommitted local development without publishing another repository first:
-
-```bash
-scripts/stage-history.sh ../pi-browser
-# Add --build-arg PI_BROWSER_SOURCE=local to your normal image build.
-```
-
-This creates an ignored source archive, used **only** with the explicit `local`
-build argument. Default builds ignore it and require `PI_BROWSER_REF`. There is no
-npm dependency tree or second server for history; the CLI needs Node >=22.19.
+Build browser-fetch normally from this repository; dependencies are pinned in
+`go.mod`/`go.sum`. No pi repository ref or source bundle is required. This changes the
+history wire protocol once (v2); later client ranking/formatting changes don't need
+server rebuilds. Update old deployments' helper env settings as described in the
+[history migration guide](docs/history.md#migrating-from-the-temporary-node-helper-implementation).
 
 ## Configuration
 
@@ -228,7 +227,8 @@ Every flag has a `BROWSER_FETCH_*` environment variable; flags win.
 | `-chrome-url` | `http://127.0.0.1:9222` | DevTools endpoint; use HTTP discovery for restart recovery and the CDP proxy |
 | `-enable-cdp` | `false` | Enable authenticated `/cdp/` HTTP/WebSocket proxy |
 | `-public-url` | request scheme/host | External gateway base URL for discovery behind TLS/path-rewriting proxies |
-| `-history-command` | disabled | JSON array of executable + argv; e.g. `["node","/opt/pi-browser/bin/history.ts"]` |
+| `-history-root` | disabled | Operator-owned Chromium user-data directory (native history) |
+| `-history-source` | `assistant` | History source id/label prefix |
 | `-max-tabs` | `4` | Concurrent navigations; ~150–300 MB each |
 | `-host-gap` | `1500ms` | Minimum delay between navigations to one host |
 | `-host-jitter` | `750ms` | Random extra delay, so pacing isn't metronomic |
@@ -283,7 +283,9 @@ IP+session+host. So the scheduler enforces:
   on an untrusted network. Anyone who can reach the port can drive a browser
   holding your sessions. The URL guard blocks private/link-local targets so a
   prompt-injected URL can't reach VM-internal services or cloud metadata; the
-  gateway never returns cookies and never runs caller-supplied JavaScript.
+  `/fetch` route never returns cookies or runs caller-supplied JavaScript. The
+  separate root-only CDP capability intentionally permits both; it is not covered
+  by fetch/session restrictions.
 - **Etiquette.** This fetches one page per explicit request, at human pace. It
   is not a crawler and shouldn't become one: no prefetching, no link walking.
   Plenty of sites disallow crawlers in robots.txt; a person reading a page they

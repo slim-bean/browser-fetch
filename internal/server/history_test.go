@@ -2,13 +2,13 @@ package server
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
+	"database/sql"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -16,28 +16,25 @@ import (
 	"github.com/slim-bean/browser-fetch/internal/config"
 )
 
-func TestHistoryHelperProcess(t *testing.T) {
-	if os.Getenv("BROWSER_FETCH_TEST_HELPER") != "1" {
-		return
+func TestNativeHistoryHTTPContract(t *testing.T) {
+	root := t.TempDir()
+	os.Mkdir(filepath.Join(root, "Default"), 0700)
+	db, err := sql.Open("sqlite", filepath.Join(root, "Default", "History"))
+	if err != nil {
+		t.Fatal(err)
 	}
-	var request map[string]any
-	_ = json.NewDecoder(os.Stdin).Decode(&request)
-	switch os.Args[len(os.Args)-1] {
-	case "large":
-		fmt.Print(strings.Repeat("x", historyOutputLimit+1))
-	case "bad":
-		fmt.Print(`{"version":999}`)
-	default:
-		_ = json.NewEncoder(os.Stdout).Encode(map[string]any{"version": 1, "operation": request["operation"], "params": request["params"], "content": []any{}, "details": map[string]any{}})
+	_, err = db.Exec(`CREATE TABLE urls(url TEXT,title TEXT,visit_count INTEGER,last_visit_time INTEGER,hidden INTEGER);
+ INSERT INTO urls VALUES('https://example.com','fixture',2,13394473600000000,0);`)
+	if err != nil {
+		t.Fatal(err)
 	}
-	os.Exit(0)
-}
-
-func TestHistoryHTTPContract(t *testing.T) {
-	t.Setenv("BROWSER_FETCH_TEST_HELPER", "1")
+	db.Close()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	cfg := config.Default()
 	cfg.Token = "fixture"
+	cfg.DriverToken = "drive"
+	cfg.ReaderToken = "read"
+	cfg.HistoryRoot = root
 	mgr := browser.New(context.Background(), browser.Options{ChromeURL: cfg.ChromeURL, Logger: log})
 	defer mgr.Close()
 	s := New(cfg, log, mgr)
@@ -55,38 +52,40 @@ func TestHistoryHTTPContract(t *testing.T) {
 		handler.ServeHTTP(res, req)
 		return res
 	}
-	if got := request("/history/search", "", `{}`).Code; got != 401 {
-		t.Fatal(got)
-	}
-	if got := request("/history/search", "xxxxxxxfixture", `{}`).Code; got != 401 {
-		t.Fatal("invalid auth scheme accepted", got)
-	}
-	if got := request("/history/search", "Bearer fixture", `{}`).Code; got != 501 {
-		t.Fatal(got)
-	}
-	for _, mode := range []string{"ok", "bad", "large"} {
-		s.cfg.HistoryCommand = []string{os.Args[0], "-test.run=TestHistoryHelperProcess", "--", mode}
-		res := request("/history/search", "Bearer fixture", `{"query":"example"}`)
-		if mode != "ok" {
-			if res.Code != 502 {
-				t.Fatalf("%s: %d", mode, res.Code)
+	for _, token := range []string{"", "Bearer read", "Bearer drive", "xxxxxxxfixture"} {
+		for _, path := range []string{"/history/query", "/history/sources", "/history/search"} {
+			if got := request(path, token, `{}`).Code; got != 401 {
+				t.Fatalf("%s %s: %d", token, path, got)
 			}
-			continue
 		}
-		if res.Code != 200 || !strings.Contains(res.Body.String(), `"query":"example"`) {
+	}
+	if res := request("/history/sources", "Bearer fixture", ""); res.Code != 200 || !strings.Contains(res.Body.String(), `"version":2`) || strings.Contains(res.Body.String(), root) {
+		t.Fatal(res.Code, res.Body.String())
+	}
+	res := request("/history/query", "Bearer fixture", `{"version":2,"sourceId":"assistant/Default","terms":["fixture"]}`)
+	if res.Code != 200 || !strings.Contains(res.Body.String(), `"url":"https://example.com"`) || strings.Contains(res.Body.String(), `"content"`) {
+		t.Fatal(res.Code, res.Body.String())
+	}
+	for _, body := range []string{`{"version":2,"sourceId":"assistant/Default","sql":"select *"}`, `{"version":2,"sourceId":"assistant/Default","path":"/etc/passwd"}`, `{"version":1}`, `{} {}`, `{"terms":["` + strings.Repeat("x", 65536) + `"]}`} {
+		if res := request("/history/query", "Bearer fixture", body); res.Code != 400 {
 			t.Fatal(res.Code, res.Body.String())
 		}
 	}
-	s.cfg.HistoryCommand = []string{os.Args[0], "-test.run=TestHistoryHelperProcess", "--", "ok"}
-	if got := request("/history/sources", "Bearer fixture", ""); got.Code != 200 || !strings.Contains(got.Body.String(), `"operation":"sources"`) {
-		t.Fatal(got.Code, got.Body.String())
+	if res := request("/history/query", "Bearer fixture", `{"version":2,"sourceId":"../../etc/passwd"}`); res.Code != 404 {
+		t.Fatal(res.Code, res.Body.String())
 	}
-	if got := request("/history/search", "Bearer fixture", `{"query":"`+strings.Repeat("x", 65536)+`"}`).Code; got != 400 {
+	if res := request("/history/search", "Bearer fixture", `{"query":"fixture"}`); res.Code != 410 {
+		t.Fatal(res.Code, res.Body.String())
+	}
+	s.historySlots <- struct{}{}
+	s.historySlots <- struct{}{}
+	if got := request("/history/query", "Bearer fixture", `{}`).Code; got != http.StatusTooManyRequests {
 		t.Fatal(got)
 	}
-	s.historySlots <- struct{}{}
-	s.historySlots <- struct{}{}
-	if got := request("/history/search", "Bearer fixture", `{}`).Code; got != http.StatusTooManyRequests {
+	<-s.historySlots
+	<-s.historySlots
+	s.cfg.HistoryRoot = ""
+	if got := request("/history/sources", "Bearer fixture", "").Code; got != 501 {
 		t.Fatal(got)
 	}
 }

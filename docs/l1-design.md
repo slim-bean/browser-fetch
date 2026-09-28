@@ -4,11 +4,11 @@ Phase 1 of the finance-fetch plan (see edw-fin `/workspace/finance-fetch/PLAN.md
 extends this gateway from a stateless reader ("render this URL") into a safe
 interaction surface. The constraints that shaped it:
 
-1. **No caller-supplied JavaScript, ever.** The API is a vocabulary of typed
+1. **No caller-supplied JavaScript on the session API.** It is a vocabulary of typed
    actions, not an interpreter. A prompt-injected page can at worst lie about
    what it showed; it cannot make the driver execute attacker JS against the
    logged-in profile.
-2. **Everything routes through the scheduler.** Every primitive that touches a
+2. **Session primitives route through the scheduler.** Every primitive that touches a
    page goes through the same per-host pacing as `/fetch`. A flow that clicks
    three times is paced like a human clicking three times.
 3. **Every action is recorded.** Actions append to a per-session evidence log
@@ -18,6 +18,11 @@ interaction surface. The constraints that shaped it:
    typed as passwords unless a `assert` action has passed within the last
    `assert_ttl` (default 30s) — enforcement lives here, in the gateway, so no
    client bug can bypass it.
+
+The separate optional raw-CDP interface is a **root-token-only** administrative
+capability, not part of this restricted driver surface. It deliberately permits
+arbitrary page JavaScript and bypasses session pacing/assertions. Do not grant the
+root token to restricted drivers; reader/driver tokens are denied CDP and history.
 
 ## API
 

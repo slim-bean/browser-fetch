@@ -30,6 +30,7 @@ import (
 
 	"github.com/slim-bean/browser-fetch/internal/browser"
 	"github.com/slim-bean/browser-fetch/internal/config"
+	"github.com/slim-bean/browser-fetch/internal/history"
 	"github.com/slim-bean/browser-fetch/internal/logx"
 	"github.com/slim-bean/browser-fetch/internal/macro"
 	"github.com/slim-bean/browser-fetch/internal/metrics"
@@ -115,7 +116,10 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /fetch", s.route("fetch", true, s.handleFetch))
 	mux.Handle("GET /healthz", s.route("healthz", false, s.handleHealth))
 	mux.Handle("GET /stats", s.route("stats", true, s.handleStats))
-	mux.Handle("POST /history/search", s.route("history", true, s.handleHistory))
+	mux.Handle("POST /history/query", s.route("history", true, s.handleHistory))
+	mux.Handle("POST /history/search", s.route("history", true, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusGone, errorBody{Code: "history_protocol_changed", Error: "The helper search API was removed; update your client to history protocol v2 (/history/query)"})
+	}))
 	mux.Handle("GET /history/sources", s.route("history", true, s.handleHistory))
 	if s.cfg.EnableCDP {
 		proxy := s.cdpProxy()
@@ -132,7 +136,8 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /runtime", s.route("runtime", true, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"service": "browser-fetch", "pid": os.Getpid(), "chrome_url": s.cfg.ChromeURL,
-			"capabilities": map[string]bool{"cdp": s.cfg.EnableCDP, "history": len(s.cfg.HistoryCommand) > 0},
+			"capabilities":    map[string]bool{"cdp": s.cfg.EnableCDP, "history": s.cfg.HistoryRoot != ""},
+			"historyProtocol": history.Version,
 		})
 	}))
 	mux.Handle("POST /session/open", s.routeDriver("session_open", s.handleSessionOpen))
@@ -175,23 +180,22 @@ func (s *Server) Handler() http.Handler {
 // routeDriver wraps a handler that requires the driver token class (driver
 // or full; readers and anonymous callers are rejected).
 func (s *Server) routeDriver(name string, h http.HandlerFunc) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		class := s.tokenClass(r)
-		if class != classDriver && class != classFull {
-			log := s.log.With("route", name, "remote", r.RemoteAddr)
-			log.Warn("session route requires the driver token")
-			writeJSON(w, http.StatusUnauthorized, errorBody{
-				Error: "session routes require the driver token",
-				Code:  "unauthorized",
-			})
-			return
-		}
-		s.route(name, true, h).ServeHTTP(w, r)
-	})
+	return s.routeClass(name, classDriver, h)
 }
 
 // route wraps a handler with request-id, logging, metrics and optional auth.
 func (s *Server) route(name string, needAuth bool, h http.HandlerFunc) http.Handler {
+	required := classNone
+	if needAuth {
+		required = classFull
+		if name == "fetch" {
+			required = classReader
+		}
+	}
+	return s.routeClass(name, required, h)
+}
+
+func (s *Server) routeClass(name string, required tokenClass, h http.HandlerFunc) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		started := time.Now()
 		id := logx.NextRequestID()
@@ -203,9 +207,9 @@ func (s *Server) route(name string, needAuth bool, h http.HandlerFunc) http.Hand
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		w.Header().Set("X-Request-Id", id)
 
-		if needAuth && !s.authorized(r) {
+		if s.tokenClass(r) < required {
 			log.Warn("unauthorized request")
-			writeJSON(rec, http.StatusUnauthorized, errorBody{Error: "missing or invalid bearer token", Code: "unauthorized"})
+			writeJSON(rec, http.StatusUnauthorized, errorBody{Error: "missing, invalid or insufficient bearer token", Code: "unauthorized"})
 		} else {
 			if name == "cdp" && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
 				log.Info("CDP WebSocket attempt") // connection-level evidence, no frame/body logging
@@ -218,10 +222,6 @@ func (s *Server) route(name string, needAuth bool, h http.HandlerFunc) http.Hand
 		log.Info("request", "status", rec.status, "bytes", rec.bytes,
 			"duration", time.Since(started).Round(time.Millisecond))
 	})
-}
-
-func (s *Server) authorized(r *http.Request) bool {
-	return s.tokenClass(r) != classNone
 }
 
 // tokenClass identifies which bearer token the caller presented.

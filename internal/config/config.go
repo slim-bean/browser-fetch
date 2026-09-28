@@ -7,12 +7,12 @@
 package config
 
 import (
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -26,8 +26,8 @@ type Config struct {
 	Token string
 	// AllowNoToken permits starting without a token (local experiments only).
 	AllowNoToken bool
-	// DriverToken is a second bearer token that may drive L1 sessions in
-	// addition to everything Token can do. Empty = Token holders only.
+	// DriverToken grants sessions/macros and fetch, not root-only CDP/history/admin.
+	// Empty = root Token holders only.
 	DriverToken string
 	// ReaderToken is a restricted token: /fetch only, never sessions. Empty =
 	// no separate reader class.
@@ -37,9 +37,10 @@ type Config struct {
 	// http://host:port is resolved to the browser websocket automatically.
 	ChromeURL string
 	// Optional authenticated browser control/history on the same HTTP listener.
-	EnableCDP      bool
-	PublicURL      string   // explicit external base URL for discovery behind a reverse proxy
-	HistoryCommand []string // executable + argv; never a shell command from a caller
+	EnableCDP     bool
+	PublicURL     string // explicit external base URL for discovery behind a reverse proxy
+	HistoryRoot   string // explicit Chromium user-data directory; empty disables history
+	HistorySource string // source label/id prefix, not a filesystem path
 
 	// MaxTabs caps concurrent navigations (one tab each).
 	MaxTabs int
@@ -106,6 +107,7 @@ func Default() Config {
 		Addr:                "127.0.0.1:8377",
 		ChromeURL:           "http://127.0.0.1:9222",
 		MaxTabs:             4,
+		HistorySource:       "assistant",
 		HostGap:             1500 * time.Millisecond,
 		HostJitter:          750 * time.Millisecond,
 		RequestTimeout:      45 * time.Second,
@@ -163,7 +165,11 @@ func Load(args []string) (Config, error) {
 		return c, err
 	}
 
-	historyCommand := os.Getenv("BROWSER_FETCH_HISTORY_COMMAND")
+	if os.Getenv("BROWSER_FETCH_HISTORY_COMMAND") != "" {
+		return c, errors.New("BROWSER_FETCH_HISTORY_COMMAND was removed; configure BROWSER_FETCH_HISTORY_ROOT for native Chromium history")
+	}
+	envStr("BROWSER_FETCH_HISTORY_ROOT", &c.HistoryRoot)
+	envStr("BROWSER_FETCH_HISTORY_SOURCE", &c.HistorySource)
 	envStr("BROWSER_FETCH_MACRO_STORE", &c.MacroStore)
 	envStr("BROWSER_FETCH_PUBLIC_URL", &c.PublicURL)
 	if err := envBool("BROWSER_FETCH_ENABLE_CDP", &c.EnableCDP); err != nil {
@@ -172,7 +178,8 @@ func Load(args []string) (Config, error) {
 	fs := flag.NewFlagSet("browser-fetch", flag.ContinueOnError)
 	fs.BoolVar(&c.EnableCDP, "enable-cdp", c.EnableCDP, "expose authenticated /cdp discovery and WebSockets (full browser authority)")
 	fs.StringVar(&c.PublicURL, "public-url", c.PublicURL, "external gateway base URL for CDP discovery behind a reverse proxy")
-	fs.StringVar(&historyCommand, "history-command", historyCommand, "history helper executable/argv as a JSON array (empty disables history)")
+	fs.StringVar(&c.HistoryRoot, "history-root", c.HistoryRoot, "Chromium user-data directory to expose as native history (empty disables)")
+	fs.StringVar(&c.HistorySource, "history-source", c.HistorySource, "history source id/label prefix")
 	fs.StringVar(&c.Addr, "addr", c.Addr, "listen address")
 	fs.StringVar(&c.Token, "token", c.Token, "bearer token for /fetch, /stats, /debug")
 	fs.StringVar(&c.DriverToken, "driver-token", c.DriverToken, "extra token allowed to drive sessions")
@@ -206,20 +213,15 @@ func Load(args []string) (Config, error) {
 		return c, err
 	}
 
-	if historyCommand != "" {
-		if err := json.Unmarshal([]byte(historyCommand), &c.HistoryCommand); err != nil {
-			return c, fmt.Errorf("history-command: %w", err)
-		}
-		if len(c.HistoryCommand) == 0 || c.HistoryCommand[0] == "" {
-			return c, errors.New("history-command needs an executable")
-		}
-	}
 	return c, c.validate()
 }
 
 func (c Config) validate() error {
-	if (c.EnableCDP || len(c.HistoryCommand) > 0) && c.Token == "" {
+	if (c.EnableCDP || c.HistoryRoot != "") && c.Token == "" {
 		return errors.New("CDP/history require a bearer token, even with allow-no-token")
+	}
+	if !regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,63}$`).MatchString(c.HistorySource) {
+		return errors.New("history-source must be a lowercase id (1–64 characters)")
 	}
 	if c.EnableCDP && !strings.HasPrefix(c.ChromeURL, "http://") {
 		return errors.New("CDP proxy requires an http:// Chrome discovery endpoint")
