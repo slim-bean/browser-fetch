@@ -22,7 +22,7 @@ deterministic replay with drift detection → evidence log per step.
   "profile_hash": "sha256:…",   // browser profile the macro was recorded on
   "steps": [
     { "action": { "kind": "navigate", "url": "https://chase.com" } },
-    { "action": { "kind": "assert", "kind_assert": "url", "pattern": "…\\.com/auth$" } },
+    { "action": { "kind": "assert", "expect": "url", "pattern": "…\\.com/auth$" } },
     { "action": { "kind": "type", "field": "password",
                   "secret": "op://Finance/Chase/login" },   // by reference, never a value
       "recorded": { "element": { "role": "textbox", "text": "Password",
@@ -33,7 +33,7 @@ deterministic replay with drift detection → evidence log per step.
                                  "candidates": ["button#login", "…"] } } },
     { "action": { "kind": "wait", "url_regexp": "accounts" } },
     { "action": { "kind": "pause", "reason": "2FA/OTP: human completes" },
-      "resume_assert": { "kind_assert": "url", "pattern": "…accounts.*" } }
+      "resume_assert": { "expect": "url", "pattern": "…accounts.*" } }
   ]
 }
 ```
@@ -60,12 +60,34 @@ Below the acceptance threshold → **replay aborts at that step** and reports
 *maintenance time*: an LLM may propose macro patches (new ladders) as diffs
 that Ed approves; runtime stays deterministic.
 
-## API surface (planned)
+## API surface (implemented on this branch)
 
 - `POST /macro/record/start` / `POST /macro/record/stop` — driver token; the
   gateway injects its own capture script into the leased tab (gateway-authored
-  JS only — the no-caller-JS rule is unchanged).
-- `GET /macro/pending` — raw recording awaiting human review.
-- `POST /macro/approve` — human (over VNC/assist channel) approves → stored.
+  JS only — the no-caller-JS rule is unchanged). The recording session is
+  held open (not idle-reaped) while the human drives.
+- `GET /macros` — all stored macros with approval status (driver token).
+- `GET /macro?id=…` — full macro JSON for human review (driver token).
+- `POST /macro/approve` — human approves `{macro_id, by}` → replayable.
 - `POST /macro/replay` — driver token; runs an approved macro in a session,
-  producing the same per-step evidence log.
+  producing the same per-step evidence log. Response includes `evidence`
+  (the session action log) and, on abort, `aborted_at_step`, `step_kind`,
+  `cause`, `drift`.
+- `POST /macro/resume` — signals a paused replay to continue (human completed
+  the OTP/CAPTCHA step).
+
+Macro endpoints require `-macro-store DIR` / `BROWSER_FETCH_MACRO_STORE`
+(0600 files; macro store disabled when unset). Replay of `type` steps needs a
+secret resolver (1Password bridge, Phase 2); a macro with type steps aborts
+at that step with "no secret resolver configured" until then.
+
+## Replay semantics (implemented)
+
+- **Secrets resolved at replay time** via the injected resolver; the value
+  exists only inside the replay call frame. The default configuration has no
+  resolver, so unresolvable macros abort — they never run with missing auth.
+- **Ladder matching**: a click tries recorded candidates first, then generated
+  text XPaths from the recorded role/text (tier-2). Tier-3 visual diff is
+  deferred. Misses are recorded in the evidence log as drift.
+- **Abort on failure**: the first failing step stops the replay with a
+  step-addressed error; later steps never execute. Replay never improvises.

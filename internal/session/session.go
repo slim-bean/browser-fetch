@@ -113,6 +113,7 @@ type Session struct {
 	log         []ActionRecord
 	closing     bool
 	pendingType bool // a type action is mid-flight; screenshots wait
+	hold        bool // recording sessions are not idle-reaped
 }
 
 // ActionRecord is one evidence-log entry.
@@ -190,6 +191,12 @@ func (m *Manager) Reap() {
 	m.mu.Lock()
 	var expired []*Session
 	for id, s := range m.sessions {
+		s.mu.Lock()
+		held := s.hold
+		s.mu.Unlock()
+		if held {
+			continue
+		}
 		if time.Since(s.lastUsed) > m.opts.MaxIdle {
 			expired = append(expired, s)
 			delete(m.sessions, id)
@@ -274,6 +281,45 @@ func (m *Manager) Run(ctx context.Context, s *Session, a Action) (any, error) {
 		m.logger().Warn("action failed", "session", s.ID, "action", a.Kind(), "err", err)
 	}
 	return res, err
+}
+
+// SetHold prevents idle reaping while set. Recording sessions need this: a human
+// interacting over VNC does not call actions, so lastUsed stays stale.
+func (s *Session) SetHold(hold bool) {
+	s.mu.Lock()
+	s.hold = hold
+	s.mu.Unlock()
+}
+
+// SetHold toggles idle-reap protection on an open session.
+func (m *Manager) SetHold(id string, hold bool) error {
+	s, err := m.Get(id)
+	if err != nil {
+		return err
+	}
+	s.SetHold(hold)
+	return nil
+}
+
+// RecorderStarter is implemented by tabs that can install the gateway's
+// interaction capture script (macro recording). The script text is
+// gateway-authored — see internal/macro.CaptureScript.
+type RecorderStarter interface {
+	StartRecorder(ctx context.Context, script, binding string) (<-chan string, error)
+}
+
+// StartRecording installs the capture script on this session's tab and returns
+// the event channel. It fails when the underlying tab does not support
+// recording.
+func (s *Session) StartRecording(ctx context.Context, script, binding string) (<-chan string, error) {
+	s.mu.Lock()
+	tab := s.tab
+	s.mu.Unlock()
+	rs, ok := tab.(RecorderStarter)
+	if !ok {
+		return nil, errors.New("this tab does not support interaction recording")
+	}
+	return rs.StartRecorder(ctx, script, binding)
 }
 
 // CanTypeCredentials reports whether an exact assertion passed recently.

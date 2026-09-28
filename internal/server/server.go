@@ -31,6 +31,7 @@ import (
 	"github.com/slim-bean/browser-fetch/internal/browser"
 	"github.com/slim-bean/browser-fetch/internal/config"
 	"github.com/slim-bean/browser-fetch/internal/logx"
+	"github.com/slim-bean/browser-fetch/internal/macro"
 	"github.com/slim-bean/browser-fetch/internal/metrics"
 	"github.com/slim-bean/browser-fetch/internal/reqlog"
 	"github.com/slim-bean/browser-fetch/internal/scheduler"
@@ -47,6 +48,8 @@ type Server struct {
 	ring         *reqlog.Ring
 	met          *metrics.Metrics
 	sessions     *session.Manager
+	macros       *macroState
+	secrets      macro.SecretResolver
 	start        time.Time
 	historySlots chan struct{}
 }
@@ -80,6 +83,11 @@ func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
 		MaxLog:        200,
 		AllowNavigate: allowHosts(cfg.AllowHosts),
 	})
+	if ms, msErr := newMacroState(cfg.MacroStore); msErr != nil {
+		log.Error("macro store unavailable; macro endpoints disabled", "dir", cfg.MacroStore, "err", msErr)
+	} else {
+		s.macros = ms
+	}
 	go s.sessionsReaper()
 	s.met = metrics.New(metrics.Sources{
 		TabsBusy:    func() float64 { return float64(mgr.Health().Tabs.Busy) },
@@ -132,6 +140,13 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("POST /session/close", s.routeDriver("session_close", s.handleSessionClose))
 	mux.Handle("GET /sessions", s.routeDriver("sessions", s.handleSessionList))
 	mux.Handle("GET /session/log", s.routeDriver("session_log", s.handleSessionLog))
+	mux.Handle("POST /macro/record/start", s.routeDriver("macro_record_start", s.handleMacroRecordStart))
+	mux.Handle("POST /macro/record/stop", s.routeDriver("macro_record_stop", s.handleMacroRecordStop))
+	mux.Handle("POST /macro/approve", s.routeDriver("macro_approve", s.handleMacroApprove))
+	mux.Handle("POST /macro/replay", s.routeDriver("macro_replay", s.handleMacroReplay))
+	mux.Handle("POST /macro/resume", s.routeDriver("macro_resume", s.handleMacroResume))
+	mux.Handle("GET /macros", s.routeDriver("macros", s.handleMacroList))
+	mux.Handle("GET /macro", s.routeDriver("macro", s.handleMacroGet))
 	mux.Handle("GET /metrics", s.route("metrics", s.cfg.MetricsAuth, promhttp.HandlerFor(
 		s.met.Registry, promhttp.HandlerOpts{Registry: s.met.Registry},
 	).ServeHTTP))
@@ -286,6 +301,12 @@ func (b browserSessionTab) Read(ctx context.Context) (session.Snapshot, error) {
 		return session.Snapshot{}, err
 	}
 	return session.Snapshot{URL: snap.URL, Title: snap.Title, HTML: snap.HTML}, nil
+}
+
+// StartRecorder forwards the gateway-authored capture script into the leased
+// tab. Part of session.RecorderStarter.
+func (b browserSessionTab) StartRecorder(ctx context.Context, script, binding string) (<-chan string, error) {
+	return b.t.StartRecorder(ctx, script, binding)
 }
 
 // sessionsReaper closes sessions idle past their TTL so pooled tabs return.

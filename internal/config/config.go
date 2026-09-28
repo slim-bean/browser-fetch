@@ -93,6 +93,9 @@ type Config struct {
 	// any host the URL guard already allows. This is a tripwire on the
 	// navigate primitive, not a sandbox: clicking a link can still navigate.
 	AllowHosts []string
+	// MacroStore is the directory macro recordings are persisted to. Empty =
+	// macro endpoints disabled.
+	MacroStore string
 
 	LogFormat string // text|json
 	LogLevel  string // debug|info|warn|error
@@ -161,6 +164,7 @@ func Load(args []string) (Config, error) {
 	}
 
 	historyCommand := os.Getenv("BROWSER_FETCH_HISTORY_COMMAND")
+	envStr("BROWSER_FETCH_MACRO_STORE", &c.MacroStore)
 	envStr("BROWSER_FETCH_PUBLIC_URL", &c.PublicURL)
 	if err := envBool("BROWSER_FETCH_ENABLE_CDP", &c.EnableCDP); err != nil {
 		return c, err
@@ -174,6 +178,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&c.DriverToken, "driver-token", c.DriverToken, "extra token allowed to drive sessions")
 	fs.StringVar(&c.ReaderToken, "reader-token", c.ReaderToken, "restricted token: /fetch only, no sessions")
 	fs.Var(&hostList{&c.AllowHosts}, "allow-hosts", "comma-separated hosts sessions may navigate to")
+	fs.StringVar(&c.MacroStore, "macro-store", c.MacroStore, "directory for macro recordings (empty disables macro endpoints)")
 	fs.BoolVar(&c.AllowNoToken, "allow-no-token", c.AllowNoToken, "start without a token (local only)")
 	fs.StringVar(&c.ChromeURL, "chrome-url", c.ChromeURL, "Chrome DevTools endpoint")
 	fs.IntVar(&c.MaxTabs, "max-tabs", c.MaxTabs, "max concurrent navigations")

@@ -102,6 +102,11 @@ For a persistent setup see `deploy/systemd/browser-fetch.service`.
 | `POST /session/close` | driver | `{"session_id":…}` — parks the tab and frees the lease |
 | `GET /sessions` | driver | live sessions with idle time and credential-typing eligibility |
 | `GET /session/log?session_id=…` | driver | the session's per-action evidence log |
+| `POST /macro/record/start` / `stop` | driver | human records a site flow; see Macros below |
+| `GET /macros`, `GET /macro?id=…` | driver | list / fetch stored macros for review |
+| `POST /macro/approve` | driver | mark a reviewed macro replayable |
+| `POST /macro/replay` | driver | run an approved macro in a session |
+| `POST /macro/resume` | driver | signal a paused replay to continue |
 
 ### Session actions
 
@@ -111,16 +116,30 @@ evaluated**. `kind` selects the action; unknown fields are rejected.
 | kind | fields | notes |
 |---|---|---|
 | `navigate` | `url` | gated by `-allow-hosts` when set, plus the usual URL guard |
-| `click` | `selector` | first visible match |
+| `click` | `selector`, `candidates` | first visible match; `candidates` is the internal selector ladder used by macro replay — the agent API refuses `click`/`type` entirely |
 | `type` | `text`, `field`, `submit` | `field=password` refused unless an exact `assert` passed within `-assert-ttl` (default 30s) |
 | `wait` | `selector` or `url_regexp`, `timeout_ms` | blocks until visible/matched |
 | `screenshot` | `full_page` | PNG, base64; result includes `sha256` |
 | `content` | — | current `{url,title,html}` snapshot |
 | `download` | `click_selector`, `filename_regexp`, `timeout_ms`, `max_bytes` | captures the file via CDP, returns base64 + `sha256` |
-| `assert` | `kind` (`url`,`title`,`landmark`,`landmarks`), `pattern`, `landmarks`, `min_match` | layered screen identity; only exact `url`/`title` matches enable credential typing |
+| `assert` | `expect` (`url`,`title`,`landmark`,`landmarks`), `pattern`, `landmarks`, `min_match` | layered screen identity; only exact `url`/`title` matches enable credential typing |
 
 Every action is recorded in the session's evidence log with outcome and
 duration; password values are recorded as length only, never text.
+
+### Macros (human-recorded site flows)
+
+Interactive actions are not agent-reachable: the agent API rejects `click`
+and `type`. A human records flows instead — the gateway injects its own
+capture script (which reports fingerprints, never secret values) while the
+human drives the browser, stores the draft unapproved, and only a human
+`/macro/approve` makes it replayable. Replay is deterministic: recorded
+selector ladders plus generated text XPaths, aborting at the first step that
+doesn't match — it never improvises. `pause` steps wait for a human (OTP,
+CAPTCHA) and verify a `resume_assert` before continuing. Secrets are stored
+as `op://` references and resolved only at replay time. See
+[`docs/macros.md`](docs/macros.md) for the macro format and trust model.
+Macro endpoints need `-macro-store DIR` (disabled when unset).
 
 ### Token classes
 

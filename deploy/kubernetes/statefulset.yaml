@@ -79,6 +79,10 @@ spec:
               value: "3m"
             - name: SCREEN_GEOMETRY
               value: "1920x1080x24"
+            # Macro recordings (human-recorded site flows) persist on the PVC
+            # next to the browser profile; 0600 files, secrets only as op:// refs.
+            - name: BROWSER_FETCH_MACRO_STORE
+              value: "/profile/macros"
             # Keep the browser's timezone consistent with the egress IP.
             - name: TZ
               value: "America/New_York"

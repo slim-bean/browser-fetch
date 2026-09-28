@@ -1,6 +1,12 @@
 package browser
 
-import "context"
+import (
+	"context"
+
+	cdppage "github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/runtime"
+	"github.com/chromedp/chromedp"
+)
 
 // Snapshot is one atomic read of a page's identity and markup.
 type Snapshot = snapshot
@@ -35,4 +41,33 @@ func (t *SessionTab) PageID() int { return t.p.id }
 // gateway, never supplied by a caller.
 func (t *SessionTab) Read(ctx context.Context) (Snapshot, error) {
 	return t.m.read(ctx, t.p)
+}
+
+// StartRecorder installs a gateway-authored interaction capture script:
+// Runtime.addBinding exposes window.__bfRecord(payload) to the page,
+// Page.addScriptToEvaluateOnNewDocument re-installs it on every navigation,
+// and an immediate evaluate covers the current document. Events arrive via
+// the returned channel. The script only *reports*; it never mutates the page.
+func (t *SessionTab) StartRecorder(ctx context.Context, script, binding string) (<-chan string, error) {
+	events := make(chan string, 64)
+	chromedp.ListenTarget(t.p.ctx, func(ev any) {
+		if e, ok := ev.(*runtime.EventBindingCalled); ok && e.Name == binding {
+			select {
+			case events <- e.Payload:
+			default: // drop when the recorder is not draining; replay is paused
+			}
+		}
+	})
+	err := chromedp.Run(ctx,
+		runtime.AddBinding(binding),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			_, err := cdppage.AddScriptToEvaluateOnNewDocument(script).Do(ctx)
+			return err
+		}),
+		chromedp.Evaluate(script, nil),
+	)
+	if err != nil {
+		return nil, err
+	}
+	return events, nil
 }
