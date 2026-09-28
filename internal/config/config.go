@@ -26,6 +26,12 @@ type Config struct {
 	Token string
 	// AllowNoToken permits starting without a token (local experiments only).
 	AllowNoToken bool
+	// DriverToken is a second bearer token that may drive L1 sessions in
+	// addition to everything Token can do. Empty = Token holders only.
+	DriverToken string
+	// ReaderToken is a restricted token: /fetch only, never sessions. Empty =
+	// no separate reader class.
+	ReaderToken string
 
 	// ChromeURL is the DevTools endpoint of an already-running Chrome.
 	// http://host:port is resolved to the browser websocket automatically.
@@ -74,6 +80,23 @@ type Config struct {
 	// MetricsAuth requires the bearer token on /metrics too.
 	MetricsAuth bool
 
+	// MaxSessions caps concurrent L1 sessions (one tab each).
+	MaxSessions int
+	// SessionIdle evicts a session idle longer than this.
+	SessionIdle time.Duration
+	// ActionTimeout bounds one session action.
+	ActionTimeout time.Duration
+	// AssertTTL is how long a passing assertion stays fresh for typing.
+	AssertTTL time.Duration
+	// AllowHosts restricts session navigations to these hosts (comma-separated;
+	// entries are exact hostnames; a leading dot matches subdomains). Empty =
+	// any host the URL guard already allows. This is a tripwire on the
+	// navigate primitive, not a sandbox: clicking a link can still navigate.
+	AllowHosts []string
+	// MacroStore is the directory macro recordings are persisted to. Empty =
+	// macro endpoints disabled.
+	MacroStore string
+
 	LogFormat string // text|json
 	LogLevel  string // debug|info|warn|error
 }
@@ -93,6 +116,10 @@ func Default() Config {
 		ChallengeRetryDelay: 2 * time.Second,
 		Debug:               true,
 		DebugRing:           200,
+		MaxSessions:         2,
+		SessionIdle:         10 * time.Minute,
+		ActionTimeout:       30 * time.Second,
+		AssertTTL:           30 * time.Second,
 		LogFormat:           "text",
 		LogLevel:            "info",
 	}
@@ -105,6 +132,8 @@ func Load(args []string) (Config, error) {
 	// Environment first so flags can override.
 	envStr("BROWSER_FETCH_ADDR", &c.Addr)
 	envStr("BROWSER_FETCH_TOKEN", &c.Token)
+	envStr("BROWSER_FETCH_DRIVER_TOKEN", &c.DriverToken)
+	envStr("BROWSER_FETCH_READER_TOKEN", &c.ReaderToken)
 	envStr("BROWSER_FETCH_CHROME_URL", &c.ChromeURL)
 	envStr("BROWSER_FETCH_LOG_FORMAT", &c.LogFormat)
 	envStr("BROWSER_FETCH_LOG_LEVEL", &c.LogLevel)
@@ -125,11 +154,17 @@ func Load(args []string) (Config, error) {
 		envBool("BROWSER_FETCH_ALLOW_PRIVATE", &c.AllowPrivate),
 		envBool("BROWSER_FETCH_METRICS_AUTH", &c.MetricsAuth),
 		envBool("BROWSER_FETCH_ALLOW_NO_TOKEN", &c.AllowNoToken),
+		envInt("BROWSER_FETCH_MAX_SESSIONS", &c.MaxSessions),
+		envDur("BROWSER_FETCH_SESSION_IDLE", &c.SessionIdle),
+		envDur("BROWSER_FETCH_ACTION_TIMEOUT", &c.ActionTimeout),
+		envDur("BROWSER_FETCH_ASSERT_TTL", &c.AssertTTL),
+		envStringList("BROWSER_FETCH_ALLOW_HOSTS", &c.AllowHosts),
 	); err != nil {
 		return c, err
 	}
 
 	historyCommand := os.Getenv("BROWSER_FETCH_HISTORY_COMMAND")
+	envStr("BROWSER_FETCH_MACRO_STORE", &c.MacroStore)
 	envStr("BROWSER_FETCH_PUBLIC_URL", &c.PublicURL)
 	if err := envBool("BROWSER_FETCH_ENABLE_CDP", &c.EnableCDP); err != nil {
 		return c, err
@@ -140,6 +175,10 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&historyCommand, "history-command", historyCommand, "history helper executable/argv as a JSON array (empty disables history)")
 	fs.StringVar(&c.Addr, "addr", c.Addr, "listen address")
 	fs.StringVar(&c.Token, "token", c.Token, "bearer token for /fetch, /stats, /debug")
+	fs.StringVar(&c.DriverToken, "driver-token", c.DriverToken, "extra token allowed to drive sessions")
+	fs.StringVar(&c.ReaderToken, "reader-token", c.ReaderToken, "restricted token: /fetch only, no sessions")
+	fs.Var(&hostList{&c.AllowHosts}, "allow-hosts", "comma-separated hosts sessions may navigate to")
+	fs.StringVar(&c.MacroStore, "macro-store", c.MacroStore, "directory for macro recordings (empty disables macro endpoints)")
 	fs.BoolVar(&c.AllowNoToken, "allow-no-token", c.AllowNoToken, "start without a token (local only)")
 	fs.StringVar(&c.ChromeURL, "chrome-url", c.ChromeURL, "Chrome DevTools endpoint")
 	fs.IntVar(&c.MaxTabs, "max-tabs", c.MaxTabs, "max concurrent navigations")
@@ -157,6 +196,10 @@ func Load(args []string) (Config, error) {
 	fs.BoolVar(&c.Debug, "debug", c.Debug, "enable /debug and /debug/pprof")
 	fs.IntVar(&c.DebugRing, "debug-ring", c.DebugRing, "recent requests retained for /debug")
 	fs.BoolVar(&c.MetricsAuth, "metrics-auth", c.MetricsAuth, "require token on /metrics")
+	fs.IntVar(&c.MaxSessions, "max-sessions", c.MaxSessions, "max concurrent L1 sessions")
+	fs.DurationVar(&c.SessionIdle, "session-idle", c.SessionIdle, "evict sessions idle longer than this")
+	fs.DurationVar(&c.ActionTimeout, "action-timeout", c.ActionTimeout, "deadline for one session action")
+	fs.DurationVar(&c.AssertTTL, "assert-ttl", c.AssertTTL, "how long a passing assertion stays fresh for typing")
 	fs.StringVar(&c.LogFormat, "log-format", c.LogFormat, "text|json")
 	fs.StringVar(&c.LogLevel, "log-level", c.LogLevel, "debug|info|warn|error")
 	if err := fs.Parse(args); err != nil {
@@ -199,6 +242,38 @@ func (c Config) validate() error {
 	if !strings.HasPrefix(c.ChromeURL, "http://") && !strings.HasPrefix(c.ChromeURL, "ws://") {
 		return fmt.Errorf("chrome-url must start with http:// or ws://, got %q", c.ChromeURL)
 	}
+	if c.MaxSessions < 1 {
+		return errors.New("max-sessions must be >= 1")
+	}
+	if c.DriverToken != "" && c.DriverToken == c.Token {
+		return errors.New("driver-token must differ from token")
+	}
+	if c.ReaderToken != "" && (c.ReaderToken == c.Token || c.ReaderToken == c.DriverToken) {
+		return errors.New("reader-token must differ from the other tokens")
+	}
+	return nil
+}
+
+// hostList is a flag.Value decoding "a.com,.b.com,c.org".
+type hostList struct {
+	p *[]string
+}
+
+func (h hostList) String() string { return strings.Join(*h.p, ",") }
+
+func (h hostList) Set(s string) error {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		part = strings.ToLower(strings.TrimSpace(part))
+		if part == "" {
+			continue
+		}
+		if !strings.HasPrefix(part, ".") && strings.Count(part, "*") > 0 {
+			return fmt.Errorf("allow-hosts entries are exact hosts or .domain wildcards, got %q", part)
+		}
+		out = append(out, part)
+	}
+	*h.p = out
 	return nil
 }
 
@@ -245,4 +320,12 @@ func envBool(key string, dst *bool) error {
 	}
 	*dst = b
 	return nil
+}
+
+func envStringList(key string, dst *[]string) error {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		return nil
+	}
+	return hostList{dst}.Set(v)
 }

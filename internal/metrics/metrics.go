@@ -23,6 +23,7 @@ type Metrics struct {
 	HTMLBytes     prometheus.Histogram
 	Deduped       prometheus.Counter
 	HTTPTotal     *prometheus.CounterVec
+	ActionsTotal  *prometheus.CounterVec
 
 	Registry *prometheus.Registry
 }
@@ -69,9 +70,13 @@ func New(src Sources) *Metrics {
 			Name: "browser_fetch_http_requests_total",
 			Help: "HTTP requests to the gateway by route and status.",
 		}, []string{"route", "status"}),
+		ActionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "browser_fetch_session_actions_total",
+			Help: "Session primitive actions by action kind and outcome.",
+		}, []string{"action", "outcome"}),
 	}
 
-	reg.MustRegister(m.FetchTotal, m.FetchDuration, m.QueueWait, m.HTMLBytes, m.Deduped, m.HTTPTotal)
+	reg.MustRegister(m.FetchTotal, m.FetchDuration, m.QueueWait, m.HTMLBytes, m.Deduped, m.HTTPTotal, m.ActionsTotal)
 
 	gauge := func(name, help string, fn func() float64) {
 		if fn == nil {
