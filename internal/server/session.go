@@ -139,7 +139,26 @@ func (s *Server) handleSessionLog(w http.ResponseWriter, r *http.Request) {
 // decodeAction decodes the typed action union by its "kind" field. The kind
 // is the envelope; the remaining fields are strict-decoded into the typed
 // struct (unknown fields rejected).
+//
+// Only read-only kinds are accepted here. click and type are interaction
+// primitives reserved for the macro recorder/replayer: the agent-facing API
+// never accepts them, so a prompt-injected or compromised agent cannot operate
+// the site. The runner calls session dispatch directly.
 func decodeAction(raw json.RawMessage) (session.Action, error) {
+	action, err := decodeAnyAction(raw)
+	if err != nil {
+		return nil, err
+	}
+	switch action.(type) {
+	case session.ClickAction, session.TypeAction:
+		return nil, errors.New("action kind is not allowed over the agent API; interaction is recorded by a human and replayed as macros")
+	}
+	return action, nil
+}
+
+// decodeAnyAction decodes any action kind, including the interaction
+// primitives. Internal callers (the macro runner) use this.
+func decodeAnyAction(raw json.RawMessage) (session.Action, error) {
 	if len(raw) == 0 {
 		return nil, errors.New("body field \"action\" is required")
 	}

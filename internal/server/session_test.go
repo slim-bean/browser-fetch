@@ -42,6 +42,28 @@ func TestDecodeActionStrict(t *testing.T) {
 	}
 }
 
+func TestDecodeActionRejectsInteraction(t *testing.T) {
+	// click and type are internal primitives for the macro runner; the
+	// agent-facing API must never accept them.
+	for _, kind := range []string{"click", "type"} {
+		var a session.Action
+		a, err := decodeAction(json.RawMessage(`{"kind":"` + kind + `"}`))
+		if err == nil {
+			t.Fatalf("%s must be rejected over the agent API", kind)
+		}
+		if a != nil {
+			t.Fatalf("%s returned an action with the error", kind)
+		}
+	}
+	// But the internal decoder still understands them (the macro runner needs
+	// them to execute recorded steps).
+	for _, kind := range []string{"click", "type"} {
+		if _, err := decodeAnyAction(json.RawMessage(`{"kind":"` + kind + `"}`)); err != nil {
+			t.Fatalf("decodeAnyAction(%s) failed: %v", kind, err)
+		}
+	}
+}
+
 func TestDecodeBodyStrict(t *testing.T) {
 	r := httptest.NewRequest("POST", "/session/open", bytes.NewBufferString(`{"host":"x.com","extra":1}`))
 	var req openRequest
@@ -57,8 +79,6 @@ func TestDecodeBodyStrict(t *testing.T) {
 func TestActionKindString(t *testing.T) {
 	for kind, a := range map[string]session.Action{
 		"navigate":   session.NavigateAction{},
-		"click":      session.ClickAction{},
-		"type":       session.TypeAction{},
 		"wait":       session.WaitAction{},
 		"screenshot": session.ScreenshotAction{},
 		"content":    session.ContentAction{},
