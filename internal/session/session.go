@@ -337,8 +337,12 @@ type NavigateAction struct {
 func (NavigateAction) Kind() string { return "navigate" }
 
 // ClickAction clicks the first element matching a Playwright-style selector.
+// Over the agent API only the single Selector form ever appeared, and it is
+// now internal-only (macro replay). Candidates is the recorded selector
+// ladder: dispatch tries each in order; the miss count is the drift signal.
 type ClickAction struct {
-	Selector string `json:"selector"`
+	Selector   string   `json:"selector"`
+	Candidates []string `json:"candidates,omitempty"`
 }
 
 func (ClickAction) Kind() string { return "click" }
@@ -388,7 +392,10 @@ const (
 // AssertAction asserts something about the current screen. Only URL and title
 // (exact matches) count as "exact" for credential-typing freshness.
 type AssertAction struct {
-	AssertKind AssertKind `json:"kind"`
+	// AssertKind selects what to check. JSON field "expect" — the outer action
+	// envelope already used "kind", so the inner field must not collide with it
+	// after envelope stripping.
+	AssertKind AssertKind `json:"expect"`
 	Pattern    string     `json:"pattern,omitempty"`   // url/title regex
 	Landmarks  []string   `json:"landmarks,omitempty"` // texts expected visible
 	MinMatch   int        `json:"min_match,omitempty"` // for landmarks
@@ -416,6 +423,9 @@ func actionDetail(a Action) string {
 	case NavigateAction:
 		return v.URL
 	case ClickAction:
+		if len(v.Candidates) > 0 {
+			return fmt.Sprintf("ladder=%d", len(v.Candidates))
+		}
 		return v.Selector
 	case TypeAction:
 		// Never record typed values for password fields.
@@ -444,7 +454,7 @@ func (m *Manager) dispatch(ctx context.Context, s *Session, tab Tab, a Action) (
 		}
 		return nil, runOn(ctx, chromedp.Navigate(v.URL))
 	case ClickAction:
-		return nil, runOn(ctx, chromedp.Click(v.Selector, chromedp.ByQueryAll, chromedp.NodeVisible))
+		return dispatchClick(ctx, v)
 	case TypeAction:
 		return nil, m.dispatchType(ctx, s, v)
 	case WaitAction:
@@ -465,6 +475,53 @@ func (m *Manager) dispatch(ctx context.Context, s *Session, tab Tab, a Action) (
 // runOn executes CDP actions on a tab. A package var so unit tests can stub
 // the browser out; production always uses chromedp.Run.
 var runOn = chromedp.Run
+
+// clickCandidateTimeout bounds one ladder attempt; the outer action timeout
+// still caps the whole dispatch.
+const clickCandidateTimeout = 5 * time.Second
+
+// dispatchClick clicks via the selector ladder. XPath candidates (starting
+// with "//") go through DOM.performSearch (BySearch), CSS through
+// querySelectorAll. Returns the number of ladder misses before the hit so the
+// evidence log carries a drift signal.
+func dispatchClick(ctx context.Context, a ClickAction) (any, error) {
+	ladder := a.Candidates
+	if len(ladder) == 0 {
+		if a.Selector == "" {
+			return nil, errors.New("click needs selector or candidates")
+		}
+		ladder = []string{a.Selector}
+	}
+	var misses []string
+	for _, sel := range ladder {
+		attempt, cancel := context.WithTimeout(ctx, clickCandidateTimeout)
+		err := runOn(attempt, chromedp.Click(sel, bySearchIfXPath(sel), chromedp.NodeVisible))
+		cancel()
+		if err == nil {
+			return ClickResult{Misses: len(misses), Matched: sel}, nil
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		misses = append(misses, sel)
+	}
+	return nil, fmt.Errorf("no ladder candidate matched (%d tried): %s", len(misses), strings.Join(misses, ", "))
+}
+
+// ClickResult reports ladder drift for the evidence log.
+type ClickResult struct {
+	// Misses is how many ladder candidates failed before the hit.
+	Misses int `json:"misses"`
+	// Matched is the selector that finally matched.
+	Matched string `json:"matched"`
+}
+
+func bySearchIfXPath(sel string) chromedp.QueryOption {
+	if strings.HasPrefix(sel, "//") {
+		return chromedp.BySearch
+	}
+	return chromedp.ByQueryAll
+}
 
 func (m *Manager) dispatchType(ctx context.Context, s *Session, a TypeAction) error {
 	if a.Field == "password" && !s.CanTypeCredentials() {
