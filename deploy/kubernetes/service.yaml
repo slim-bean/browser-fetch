@@ -8,6 +8,8 @@ spec:
   type: ClusterIP
   selector:
     app: browser-fetch
+  # All agent traffic (fetch, CDP HTTP/WebSocket, history) uses 8377.
+  # Raw Chrome CDP remains on pod loopback; no 9222 Service port.
   ports:
     - name: http
       port: 8377

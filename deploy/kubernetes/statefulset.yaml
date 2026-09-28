@@ -54,6 +54,16 @@ spec:
               value: "0.0.0.0:8377"
             - name: BROWSER_FETCH_CHROME_URL
               value: "http://127.0.0.1:9222"
+            # Fetch, authenticated CDP (HTTP + WebSocket), and history all use 8377.
+            # The bearer token now grants full control of this browser/profile.
+            - name: BROWSER_FETCH_ENABLE_CDP
+              value: "true"
+            - name: BROWSER_FETCH_BACKGROUND_TABS
+              value: "true"
+            - name: BROWSER_FETCH_HISTORY_COMMAND
+              value: '["node","/opt/pi-browser/bin/history.ts"]'
+            # History defaults to CHROME_PROFILE. Override
+            # PI_BROWSER_HISTORY_CHROMIUM_ROOTS only for explicit additional roots.
             - name: BROWSER_FETCH_LOG_FORMAT
               value: "json"
             - name: BROWSER_FETCH_MAX_TABS
@@ -65,6 +75,8 @@ spec:
             # Hold an unsolved challenge open so a human can clear it over VNC.
             - name: BROWSER_FETCH_ASSIST_TIMEOUT
               value: "120s"
+            - name: BROWSER_FETCH_REQUEST_TIMEOUT
+              value: "3m"
             - name: SCREEN_GEOMETRY
               value: "1920x1080x24"
             # Keep the browser's timezone consistent with the egress IP.

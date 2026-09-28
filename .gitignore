@@ -1,2 +1,4 @@
 /browser-fetch
 /dist/
+/bin/
+/deploy/history-source/*.tar.gz

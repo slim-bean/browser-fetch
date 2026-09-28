@@ -24,7 +24,6 @@ flags=(
   --no-first-run
   --no-default-browser-check
   --disable-features=Translate
-  --restore-last-session=false
   --hide-crash-restore-bubble
   # No keyring in a container; without this Chrome blocks on gnome-keyring.
   --password-store=basic

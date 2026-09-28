@@ -11,12 +11,16 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/pprof"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -32,24 +36,26 @@ import (
 )
 
 type Server struct {
-	cfg   config.Config
-	log   *slog.Logger
-	mgr   *browser.Manager
-	sched *scheduler.Scheduler[*browser.Result]
-	guard *urlguard.Guard
-	ring  *reqlog.Ring
-	met   *metrics.Metrics
-	start time.Time
+	cfg          config.Config
+	log          *slog.Logger
+	mgr          *browser.Manager
+	sched        *scheduler.Scheduler[*browser.Result]
+	guard        *urlguard.Guard
+	ring         *reqlog.Ring
+	met          *metrics.Metrics
+	start        time.Time
+	historySlots chan struct{}
 }
 
 func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
 	s := &Server{
-		cfg:   cfg,
-		log:   log,
-		mgr:   mgr,
-		guard: urlguard.New(cfg.AllowPrivate),
-		ring:  reqlog.NewRing(cfg.DebugRing),
-		start: time.Now(),
+		cfg:          cfg,
+		log:          log,
+		mgr:          mgr,
+		guard:        urlguard.New(cfg.AllowPrivate),
+		ring:         reqlog.NewRing(cfg.DebugRing),
+		start:        time.Now(),
+		historySlots: make(chan struct{}, 2),
 		sched: scheduler.New[*browser.Result](scheduler.Options{
 			MaxSlots: cfg.MaxTabs,
 			HostGap:  cfg.HostGap,
@@ -82,6 +88,26 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /fetch", s.route("fetch", true, s.handleFetch))
 	mux.Handle("GET /healthz", s.route("healthz", false, s.handleHealth))
 	mux.Handle("GET /stats", s.route("stats", true, s.handleStats))
+	mux.Handle("POST /history/search", s.route("history", true, s.handleHistory))
+	mux.Handle("GET /history/sources", s.route("history", true, s.handleHistory))
+	if s.cfg.EnableCDP {
+		proxy := s.cdpProxy()
+		mux.Handle("/cdp/", s.route("cdp", true, func(w http.ResponseWriter, r *http.Request) {
+			base := s.cdpBase(r)
+			if base == "" {
+				writeJSON(w, http.StatusBadRequest, errorBody{Code: "bad_request", Error: "Invalid gateway Host"})
+				return
+			}
+			proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), cdpBaseKey{}, base)))
+		}))
+	}
+	// Authenticated identity for local supervisors. No token or target content.
+	mux.Handle("GET /runtime", s.route("runtime", true, func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"service": "browser-fetch", "pid": os.Getpid(), "chrome_url": s.cfg.ChromeURL,
+			"capabilities": map[string]bool{"cdp": s.cfg.EnableCDP, "history": len(s.cfg.HistoryCommand) > 0},
+		})
+	}))
 	mux.Handle("GET /metrics", s.route("metrics", s.cfg.MetricsAuth, promhttp.HandlerFor(
 		s.met.Registry, promhttp.HandlerOpts{Registry: s.met.Registry},
 	).ServeHTTP))
@@ -124,6 +150,9 @@ func (s *Server) route(name string, needAuth bool, h http.HandlerFunc) http.Hand
 			log.Warn("unauthorized request")
 			writeJSON(rec, http.StatusUnauthorized, errorBody{Error: "missing or invalid bearer token", Code: "unauthorized"})
 		} else {
+			if name == "cdp" && strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				log.Info("CDP WebSocket attempt") // connection-level evidence, no frame/body logging
+			}
 			h(rec, r)
 		}
 
@@ -140,7 +169,7 @@ func (s *Server) authorized(r *http.Request) bool {
 	}
 	const prefix = "Bearer "
 	h := r.Header.Get("Authorization")
-	if len(h) <= len(prefix) {
+	if !strings.HasPrefix(h, prefix) || len(h) <= len(prefix) {
 		return false
 	}
 	got, want := h[len(prefix):], s.cfg.Token
@@ -195,6 +224,16 @@ func (r *statusRecorder) Write(b []byte) (int, error) {
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += n
 	return n, err
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(r.ResponseWriter).Hijack()
+	if err == nil {
+		r.status = http.StatusSwitchingProtocols
+	}
+	return conn, rw, err
 }
 
 func (r *statusRecorder) Flush() {

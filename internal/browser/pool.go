@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
 
@@ -33,8 +35,9 @@ type docResponse struct {
 // forever; they are parked on about:blank between jobs so no page state leaks
 // between fetches, while cookies (shared by the browser context) persist.
 type pool struct {
-	m    *Manager
-	size int
+	m     *Manager
+	alloc context.Context
+	size  int
 
 	mu      sync.Mutex
 	pages   []*page
@@ -53,11 +56,11 @@ type PoolStat struct {
 	Retired int `json:"retired"`
 }
 
-func newPool(m *Manager, size int) *pool {
+func newPool(m *Manager, alloc context.Context, size int) *pool {
 	if size < 1 {
 		size = 1
 	}
-	return &pool{m: m, size: size, free: make(chan *page, size)}
+	return &pool{m: m, alloc: alloc, size: size, free: make(chan *page, size)}
 }
 
 func (p *pool) stat() PoolStat {
@@ -159,11 +162,40 @@ func (p *pool) newPage() (*page, error) {
 	id := p.nextID
 	p.mu.Unlock()
 
-	pctx, cancel := chromedp.NewContext(p.m.alloc)
+	pctx, cancel := chromedp.NewContext(p.alloc)
+	if p.m.opts.BackgroundTabs {
+		// Targets allocates only the browser connection, not a foreground tab.
+		// The control context owns that connection until this worker is retired.
+		control, stopControl := pctx, cancel
+		targets, err := chromedp.Targets(control)
+		if err != nil {
+			stopControl()
+			return nil, &NavError{Err: err}
+		}
+		hasPage := false
+		for _, info := range targets {
+			if info.Type == "page" {
+				hasPage = true
+				break
+			}
+		}
+		executor := cdp.WithExecutor(control, chromedp.FromContext(control).Browser)
+		create := target.CreateTarget("about:blank").WithBackground(true)
+		if !hasPage {
+			create = create.WithNewWindow(true).WithWindowState(target.WindowStateMinimized)
+		}
+		targetID, err := create.Do(executor)
+		if err != nil {
+			stopControl()
+			return nil, &NavError{Err: err}
+		}
+		var stopTab context.CancelFunc
+		pctx, stopTab = chromedp.NewContext(control, chromedp.WithTargetID(targetID))
+		cancel = func() { stopTab(); stopControl() }
+	}
 	pg := &page{id: id, ctx: pctx, cancel: cancel, createdAt: time.Now()}
 
-	// This first Run creates the target in Chrome's default browser context,
-	// so the tab shares the profile's cookies.
+	// Attach/initialize in Chrome's default browser context (shared cookies).
 	if err := p.m.prepareTab(pctx); err != nil {
 		cancel()
 		return nil, &NavError{Err: err}
