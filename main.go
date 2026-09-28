@@ -71,6 +71,7 @@ func run() error {
 		ChallengeRetries:    cfg.ChallengeRetries,
 		ChallengeRetryDelay: cfg.ChallengeRetryDelay,
 		BlockMedia:          cfg.BlockMedia,
+		BackgroundTabs:      cfg.BackgroundTabs,
 		Logger:              log,
 	})
 	defer mgr.Close()

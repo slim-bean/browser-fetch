@@ -7,9 +7,11 @@
 package config
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -28,6 +30,10 @@ type Config struct {
 	// ChromeURL is the DevTools endpoint of an already-running Chrome.
 	// http://host:port is resolved to the browser websocket automatically.
 	ChromeURL string
+	// Optional authenticated browser control/history on the same HTTP listener.
+	EnableCDP      bool
+	PublicURL      string   // explicit external base URL for discovery behind a reverse proxy
+	HistoryCommand []string // executable + argv; never a shell command from a caller
 
 	// MaxTabs caps concurrent navigations (one tab each).
 	MaxTabs int
@@ -54,6 +60,8 @@ type Config struct {
 	// BlockMedia drops images/media/fonts to save bandwidth. Off by default:
 	// some bot-protection scoring notices that images never loaded.
 	BlockMedia bool
+	// BackgroundTabs prevents worker creation from activating Chrome.
+	BackgroundTabs bool
 	// AllowPrivate permits fetching loopback/private/link-local addresses.
 	// Off by default so a prompt-injected URL cannot reach VM-internal or
 	// cloud-metadata endpoints through the browser.
@@ -113,6 +121,7 @@ func Load(args []string) (Config, error) {
 		envDur("BROWSER_FETCH_CHALLENGE_RETRY_DELAY", &c.ChallengeRetryDelay),
 		envBool("BROWSER_FETCH_DEBUG", &c.Debug),
 		envBool("BROWSER_FETCH_BLOCK_MEDIA", &c.BlockMedia),
+		envBool("BROWSER_FETCH_BACKGROUND_TABS", &c.BackgroundTabs),
 		envBool("BROWSER_FETCH_ALLOW_PRIVATE", &c.AllowPrivate),
 		envBool("BROWSER_FETCH_METRICS_AUTH", &c.MetricsAuth),
 		envBool("BROWSER_FETCH_ALLOW_NO_TOKEN", &c.AllowNoToken),
@@ -120,7 +129,15 @@ func Load(args []string) (Config, error) {
 		return c, err
 	}
 
+	historyCommand := os.Getenv("BROWSER_FETCH_HISTORY_COMMAND")
+	envStr("BROWSER_FETCH_PUBLIC_URL", &c.PublicURL)
+	if err := envBool("BROWSER_FETCH_ENABLE_CDP", &c.EnableCDP); err != nil {
+		return c, err
+	}
 	fs := flag.NewFlagSet("browser-fetch", flag.ContinueOnError)
+	fs.BoolVar(&c.EnableCDP, "enable-cdp", c.EnableCDP, "expose authenticated /cdp discovery and WebSockets (full browser authority)")
+	fs.StringVar(&c.PublicURL, "public-url", c.PublicURL, "external gateway base URL for CDP discovery behind a reverse proxy")
+	fs.StringVar(&historyCommand, "history-command", historyCommand, "history helper executable/argv as a JSON array (empty disables history)")
 	fs.StringVar(&c.Addr, "addr", c.Addr, "listen address")
 	fs.StringVar(&c.Token, "token", c.Token, "bearer token for /fetch, /stats, /debug")
 	fs.BoolVar(&c.AllowNoToken, "allow-no-token", c.AllowNoToken, "start without a token (local only)")
@@ -135,6 +152,7 @@ func Load(args []string) (Config, error) {
 	fs.IntVar(&c.ChallengeRetries, "challenge-retries", c.ChallengeRetries, "re-navigations after an unresolved challenge")
 	fs.DurationVar(&c.ChallengeRetryDelay, "challenge-retry-delay", c.ChallengeRetryDelay, "delay before a challenge retry")
 	fs.BoolVar(&c.BlockMedia, "block-media", c.BlockMedia, "block images/media/fonts")
+	fs.BoolVar(&c.BackgroundTabs, "background-tabs", c.BackgroundTabs, "create worker tabs without activating Chrome")
 	fs.BoolVar(&c.AllowPrivate, "allow-private", c.AllowPrivate, "allow private/loopback targets")
 	fs.BoolVar(&c.Debug, "debug", c.Debug, "enable /debug and /debug/pprof")
 	fs.IntVar(&c.DebugRing, "debug-ring", c.DebugRing, "recent requests retained for /debug")
@@ -145,10 +163,30 @@ func Load(args []string) (Config, error) {
 		return c, err
 	}
 
+	if historyCommand != "" {
+		if err := json.Unmarshal([]byte(historyCommand), &c.HistoryCommand); err != nil {
+			return c, fmt.Errorf("history-command: %w", err)
+		}
+		if len(c.HistoryCommand) == 0 || c.HistoryCommand[0] == "" {
+			return c, errors.New("history-command needs an executable")
+		}
+	}
 	return c, c.validate()
 }
 
 func (c Config) validate() error {
+	if (c.EnableCDP || len(c.HistoryCommand) > 0) && c.Token == "" {
+		return errors.New("CDP/history require a bearer token, even with allow-no-token")
+	}
+	if c.EnableCDP && !strings.HasPrefix(c.ChromeURL, "http://") {
+		return errors.New("CDP proxy requires an http:// Chrome discovery endpoint")
+	}
+	if c.PublicURL != "" {
+		u, err := url.Parse(c.PublicURL)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return errors.New("public-url must be an http(s) base URL without credentials, query or fragment")
+		}
+	}
 	if c.Token == "" && !c.AllowNoToken {
 		return errors.New("no token set: pass -token / BROWSER_FETCH_TOKEN, or -allow-no-token to run unauthenticated")
 	}

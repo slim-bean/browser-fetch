@@ -90,6 +90,10 @@ For a persistent setup see `deploy/systemd/browser-fetch.service`.
 | `GET /fetch?url=…` | yes | same, convenient for `curl` |
 | `GET /healthz` | no | Chrome connectivity, version, tab pool, pending assists |
 | `GET /stats` | yes | scheduler snapshot: queue, per-host cooldowns, totals |
+| `GET /runtime` | yes | service identity + configured `capabilities: {cdp,history}` (no secrets) |
+| `/cdp/…` | yes | optional Chrome HTTP discovery + WebSocket proxy, full browser control |
+| `POST /history/search` | yes | optional pi-browser history query (same parameters as `browser_history`) |
+| `GET /history/sources` | yes | configured remote source ids/labels, not filesystem paths |
 | `GET /debug` | yes | live HTML dashboard; `?format=json` for machines |
 | `GET /debug/pprof/…` | yes | Go profiling |
 | `GET /metrics` | optional | Prometheus (`-metrics-auth` to require the token) |
@@ -105,6 +109,63 @@ curl -s -H "Authorization: Bearer $TOKEN" \
   -d '{"url":"https://example.com/"}' | jq '.title, (.html|length)'
 ```
 
+## Single-port assistant gateway
+
+The same HTTP listener can serve page retrieval, interactive CDP and browser history.
+Chrome stays on loopback; clients do **not** need a raw CDP port or a profile mount.
+
+```bash
+export BROWSER_FETCH_TOKEN=…
+export PI_BROWSER_HISTORY_CHROMIUM_ROOTS='[{"browser":"assistant","dir":"/profile/chrome"}]'
+export BROWSER_FETCH_HISTORY_COMMAND='["node","/opt/pi-browser/bin/history.ts"]'
+browser-fetch -enable-cdp -background-tabs -addr 0.0.0.0:8377 -chrome-url http://127.0.0.1:9222
+```
+
+CDP and history are opt-in for the Go binary, and require a token even with
+`-allow-no-token`. The container includes Node + pi-browser and configures the history
+helper; its entrypoint defaults the history root to `CHROME_PROFILE` (override
+`PI_BROWSER_HISTORY_CHROMIUM_ROOTS` to select other explicit roots). The Kubernetes
+manifest also enables CDP and background worker tabs. The same bearer token authorizes
+all three interfaces. This is intended for your trusted assistant workloads—not
+per-tab/per-action isolation or protection against hostile authorized agents.
+
+`/cdp/json/version` and `/cdp/json/list` rewrite `webSocketDebuggerUrl` back through
+the gateway. All HTTP discovery and WebSocket upgrades authenticate. Only fixed
+Chrome upstream paths are proxied; gateway credentials are not forwarded to Chrome.
+For TLS termination or a stripped ingress prefix, set e.g.
+`-public-url=https://browser.example/assistant`. Forwarded headers aren't trusted
+implicitly. The proxy handles WebSockets; ensure any outer proxy does too.
+
+The history helper is **pi-browser's own implementation**, called over bounded JSON
+stdin/stdout (no extra listener). It only searches operator-configured Chromium roots,
+never host-wide browser discovery, and accepts query parameters—not paths, SQL or
+commands—from clients. Two helpers may run concurrently; excess requests return 429.
+Queries have a 15-second deadline, 64-KiB input limit and 2-MiB output limit. Missing
+helpers return an explicit error, not a fallback. `/runtime` advertises configuration,
+not proof that a helper's files/data are currently readable.
+
+CDP intentionally grants more authority than `/fetch`: it can read cookies, execute
+page JavaScript and navigate anywhere Chrome can reach. Fetch URL guards and pacing
+do not apply to raw CDP. Logs observe HTTP requests / WebSocket connection lifetime,
+**not individual CDP commands or every browser-originated network request**. Keep the
+endpoint on a trusted network or behind an authenticated TLS boundary. VNC remains an
+optional separate human-access path; all agent traffic uses just the HTTP port.
+
+### Container source dependency
+
+Release builds require `--build-arg PI_BROWSER_REF=<commit-containing-bin/history.ts>`.
+The image fetches that pi-browser ref; pin a commit rather than a moving branch.
+For uncommitted local development without publishing another repository first:
+
+```bash
+scripts/stage-history.sh ../pi-browser
+# Add --build-arg PI_BROWSER_SOURCE=local to your normal image build.
+```
+
+This creates an ignored source archive, used **only** with the explicit `local`
+build argument. Default builds ignore it and require `PI_BROWSER_REF`. There is no
+npm dependency tree or second server for history; the CLI needs Node >=22.19.
+
 ## Configuration
 
 Every flag has a `BROWSER_FETCH_*` environment variable; flags win.
@@ -113,7 +174,10 @@ Every flag has a `BROWSER_FETCH_*` environment variable; flags win.
 |---|---|---|
 | `-addr` | `127.0.0.1:8377` | Use the VM's private IP to reach it from the host |
 | `-token` | — | **Required** unless `-allow-no-token` |
-| `-chrome-url` | `http://127.0.0.1:9222` | DevTools endpoint; `http://` is resolved to the ws URL |
+| `-chrome-url` | `http://127.0.0.1:9222` | DevTools endpoint; use HTTP discovery for restart recovery and the CDP proxy |
+| `-enable-cdp` | `false` | Enable authenticated `/cdp/` HTTP/WebSocket proxy |
+| `-public-url` | request scheme/host | External gateway base URL for discovery behind TLS/path-rewriting proxies |
+| `-history-command` | disabled | JSON array of executable + argv; e.g. `["node","/opt/pi-browser/bin/history.ts"]` |
 | `-max-tabs` | `4` | Concurrent navigations; ~150–300 MB each |
 | `-host-gap` | `1500ms` | Minimum delay between navigations to one host |
 | `-host-jitter` | `750ms` | Random extra delay, so pacing isn't metronomic |
@@ -124,6 +188,7 @@ Every flag has a `BROWSER_FETCH_*` environment variable; flags win.
 | `-challenge-retry-delay` | `2s` | Wait before that retry |
 | `-assist-timeout` | `0` (off) | Hold an unsolved challenge for a human to click |
 | `-block-media` | `false` | Off by default: some scoring notices images never loaded |
+| `-background-tabs` | `false` | Create worker tabs without activating Chrome (`BROWSER_FETCH_BACKGROUND_TABS`); enabled by pi-assistant |
 | `-allow-private` | `false` | Permit loopback/private targets (SSRF guard off) |
 | `-debug` | `true` | `/debug` and `/debug/pprof` |
 | `-debug-ring` | `200` | Recent requests retained |
@@ -154,9 +219,15 @@ IP+session+host. So the scheduler enforces:
   `/healthz` and `/metrics` (`browser_fetch_assists_pending`).
 - **Tabs are never closed**, only parked on `about:blank`, so Chrome always has
   a target and cookies stay shared. Broken tabs are retired and replaced.
-- **Chrome restarts** are the human's business: the gateway reconnects on its
-  own. Restart Chrome (not the profile) if memory creeps; back up the profile
-  directory to keep your logins.
+- **Chrome lifecycle** remains external: launch it yourself or use pi-assistant.
+  With an HTTP CDP endpoint, the gateway checks Chrome's websocket identity before
+  each fetch and replaces its allocator/tab pool after a restart. In-flight work
+  can fail; it is not replayed. Reuse the profile directory to retain cookies/history.
+  A fixed `ws://...` endpoint must be updated when its browser generation changes.
+- **Background work.** `-background-tabs` allocates browser connections without
+  creating foreground tabs, then creates each worker with CDP `background: true`.
+  It does not activate the browser for assist mode; a human can bring the window
+  forward deliberately. Initial desktop launch behavior belongs to the launcher.
 - **Security.** Bind to loopback or the VM's private interface, never `0.0.0.0`
   on an untrusted network. Anyone who can reach the port can drive a browser
   holding your sessions. The URL guard blocks private/link-local targets so a

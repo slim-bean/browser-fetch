@@ -5,7 +5,7 @@ Chrome profile on a PVC so logins and challenge cookies survive restarts.
 
 ```
         ┌─ pod ─────────────────────────────────────────────┐
- :8377 ─┤ browser-fetch ──CDP:9222(loopback)── Chrome        │
+ :8377 ─┤ gateway: fetch / CDP proxy / history ── Chrome        │
  :5900 ─┤ x11vnc ── Xvfb :0 (1920x1080) ── fluxbox           │
         │ supervisord (PID 1, root) → all programs as uid 1000│
         └──────────────── /profile (PVC) ────────────────────┘
@@ -35,9 +35,17 @@ types, hence the flags):
 
 ```bash
 docker buildx build --builder <container-driver-builder> --platform linux/amd64 \
+  --build-arg PI_BROWSER_REF=<pi-browser-commit-with-history-helper> \
   --provenance=false --sbom=false \
   --output "type=image,name=registry.edjusted.com/browser-fetch/browser-fetch:$TAG,push=true,oci-mediatypes=true" .
 ```
+
+The history helper uses the pi-browser implementation bundled at `PI_BROWSER_REF`.
+For local, uncommitted source, run `scripts/stage-history.sh ../pi-browser` and use
+`--build-arg PI_BROWSER_SOURCE=local` instead. Build/publish a new image before
+applying the updated manifest; an older image does not have these APIs/helper.
+Use a new tag/digest: the template uses `IfNotPresent`, so reusing the same `dev`
+tag can retain an old cached image.
 
 ## Connecting a client
 
@@ -48,6 +56,36 @@ PI_SEARCH_BROWSER_TOKEN=<token from the secret>
 ```
 
 From outside the cluster: `kubectl -n browser-test port-forward svc/browser-fetch 8377:8377`.
+
+### pi-assistant in a Yono/container workspace
+
+Install the updated pi-assistant, pi-devtools, pi-search and pi-browser packages in
+the agent image. Configure `.pi/assistant.json`:
+
+```json
+{
+  "mode": "external",
+  "gatewayUrl": "http://browser-fetch.browser-test.svc.cluster.local:8377",
+  "tokenEnv": "PI_ASSISTANT_GATEWAY_TOKEN",
+  "humanUrl": "https://your-guacamole/"
+}
+```
+
+Provide the gateway Secret's token through that environment variable, or use a
+mounted Secret file via `tokenFile`. All agent traffic uses **8377**, including CDP
+WebSockets and history; do not expose Chrome's raw 9222 port. Kubernetes/supervisord
+owns browser startup. Agent sessions must not start local replacement browsers or
+mount the profile PVC. No Yono egress/NetworkPolicy changes are performed here—allow
+only your intended assistant workloads to reach the gateway through your existing
+operator configuration. CDP grants the full browser's authority, not just reading.
+
+If an ingress terminates TLS or strips a prefix, configure `BROWSER_FETCH_PUBLIC_URL`
+with its external base URL and enable WebSocket forwarding there. Without that
+setting, discovery uses the gateway request's own scheme and Host.
+
+The existing 5900 service port is optional **human-only** VNC access, not an agent
+dependency. `/assistant show` selects the remote tab and prints the viewer URL; it
+does not open Chrome on the agent host.
 
 ## Watching and driving the browser (Guacamole)
 
@@ -142,7 +180,9 @@ bus` (no dbus daemon), `DEPRECATED_ENDPOINT` from GCM registration.
 Deliberately modest for a personal cluster, in rough order of what to fix first
 if this ever faces anything hostile:
 
-1. No NetworkPolicy — anything in the cluster can reach :8377 and :5900.
+1. No NetworkPolicy — anything in the cluster can reach :8377 and :5900. The HTTP
+   bearer token now also authorizes full CDP and history when enabled. Those endpoints
+   require authentication on discovery, queries and WebSocket upgrades.
 2. VNC is password-only and unencrypted; keep it cluster-internal and reach it
    through Guacamole, never an Ingress.
 3. `seccompProfile: Unconfined` (see above).

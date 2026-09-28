@@ -40,6 +40,7 @@ type Options struct {
 	ChallengeRetries    int
 	ChallengeRetryDelay time.Duration
 	BlockMedia          bool
+	BackgroundTabs      bool
 	Logger              *slog.Logger
 }
 
@@ -47,10 +48,14 @@ type Options struct {
 type Manager struct {
 	opts  Options
 	log   *slog.Logger
+	root  context.Context
 	alloc context.Context
 	stop  context.CancelFunc
 
-	pool *pool
+	poolMu sync.Mutex // guards browser generation and pool replacement
+	pool   *pool
+	wsURL  string
+	closed bool
 
 	mu        sync.Mutex
 	connected bool
@@ -113,17 +118,67 @@ func New(ctx context.Context, o Options) *Manager {
 	m := &Manager{
 		opts:    o,
 		log:     o.Logger,
+		root:    ctx,
 		alloc:   allocCtx,
 		stop:    stop,
 		assists: make(map[int]*Assist),
 	}
-	m.pool = newPool(m, o.MaxTabs)
+	m.pool = newPool(m, allocCtx, o.MaxTabs)
 	return m
 }
 
 func (m *Manager) Close() {
+	m.poolMu.Lock()
+	defer m.poolMu.Unlock()
+	m.closed = true
 	m.pool.closeAll()
 	m.stop()
+}
+
+// currentPool creates fresh tabs when Chrome's websocket identity changes.
+// Allocators belong to a generation; no page state or actions are replayed.
+func (m *Manager) currentPool(ctx context.Context) (*pool, error) {
+	m.poolMu.Lock()
+	defer m.poolMu.Unlock()
+	if m.closed {
+		return nil, errors.New("browser manager is closed")
+	}
+	ws := m.opts.ChromeURL
+	if strings.HasPrefix(ws, "http://") {
+		probeCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, strings.TrimSuffix(ws, "/")+"/json/version", nil)
+		if err != nil {
+			return nil, err
+		}
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer res.Body.Close()
+		var version struct {
+			WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+		}
+		if res.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("Chrome discovery returned HTTP %d", res.StatusCode)
+		}
+		if err := decodeJSON(res.Body, &version); err != nil {
+			return nil, err
+		}
+		ws = version.WebSocketDebuggerURL
+		if ws == "" {
+			return nil, errors.New("Chrome discovery returned no websocket endpoint")
+		}
+	}
+	if ws != m.wsURL {
+		m.pool.closeAll()
+		m.stop()
+		m.alloc, m.stop = chromedp.NewRemoteAllocator(m.root, ws)
+		m.pool = newPool(m, m.alloc, m.opts.MaxTabs)
+		m.wsURL = ws
+		m.log.Info("attached browser generation", "websocket", ws)
+	}
+	return m.pool, nil
 }
 
 // Probe checks the DevTools endpoint and caches the browser version. It is
@@ -183,19 +238,26 @@ func (m *Manager) Health() Health {
 		h.Assists = append(h.Assists, *a)
 	}
 	m.mu.Unlock()
-	h.Tabs = m.pool.stat()
+	m.poolMu.Lock()
+	pool := m.pool
+	m.poolMu.Unlock()
+	h.Tabs = pool.stat()
 	return h
 }
 
 // Fetch renders one URL. Pacing and deduplication are the scheduler's job;
 // this function assumes it may navigate immediately.
 func (m *Manager) Fetch(ctx context.Context, req Request) (*Result, error) {
-	p, err := m.pool.acquire(ctx)
+	pool, err := m.currentPool(ctx)
+	if err != nil {
+		return nil, &NavError{Err: err}
+	}
+	p, err := pool.acquire(ctx)
 	if err != nil {
 		return nil, err
 	}
 	healthy := true
-	defer func() { m.pool.release(p, healthy) }()
+	defer func() { pool.release(p, healthy) }()
 
 	log := m.log.With("page", p.id, "url", req.URL)
 

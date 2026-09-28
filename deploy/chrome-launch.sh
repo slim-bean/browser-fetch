@@ -37,6 +37,5 @@ exec "$CHROME" \
   --no-first-run \
   --no-default-browser-check \
   --disable-features=Translate \
-  --restore-last-session=false \
   "$@" \
   about:blank

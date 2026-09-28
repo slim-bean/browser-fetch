@@ -22,6 +22,25 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
       -ldflags="-s -w" -o /out/browser-fetch .
 
+# ---- history helper (same implementation used by pi-browser) ------------------
+# Pin a pi-browser commit containing bin/history.ts. No separate HTTP service.
+FROM node:24-bookworm-slim AS history
+ARG PI_BROWSER_REF
+ARG PI_BROWSER_SOURCE=git
+COPY deploy/history-source/ /opt/history-source/
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates \
+ && mkdir -p /opt/pi-browser \
+ && if [ "$PI_BROWSER_SOURCE" = local ]; then \
+      tar -xzf /opt/history-source/pi-browser.tar.gz -C /opt/pi-browser; \
+    elif [ "$PI_BROWSER_SOURCE" = git ] && [ -n "$PI_BROWSER_REF" ]; then \
+      git -C /opt/pi-browser init \
+      && git -C /opt/pi-browser remote add origin https://github.com/slim-bean/pi-browser.git \
+      && git -C /opt/pi-browser fetch --depth 1 origin "$PI_BROWSER_REF" \
+      && git -C /opt/pi-browser checkout --detach FETCH_HEAD; \
+    else echo 'Set PI_BROWSER_REF, or stage local source and use PI_BROWSER_SOURCE=local' >&2; exit 1; fi \
+ && test -f /opt/pi-browser/bin/history.ts \
+ && rm -rf /opt/pi-browser/.git
+
 # ---- runtime -----------------------------------------------------------------
 FROM debian:bookworm-slim
 
@@ -38,7 +57,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && apt-get update && apt-get install -y --no-install-recommends \
       google-chrome-stable \
       xvfb x11vnc fluxbox xdotool \
-      supervisor tini procps \
+      supervisor tini procps libstdc++6 libatomic1 \
       fonts-liberation fonts-dejavu-core fonts-noto-core fonts-noto-color-emoji \
       dbus-x11 \
  && apt-get purge -y gnupg \
@@ -52,6 +71,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN useradd --uid 1000 --create-home --home-dir /home/chrome --shell /usr/sbin/nologin chrome
 
 COPY --from=build /out/browser-fetch /usr/local/bin/browser-fetch
+COPY --from=history /usr/local/bin/node /usr/local/bin/node
+COPY --from=history /opt/pi-browser /opt/pi-browser
 COPY deploy/container/supervisord.conf /etc/supervisor/supervisord.conf
 COPY deploy/container/start-chrome.sh  /usr/local/bin/start-chrome
 COPY deploy/container/start-vnc.sh     /usr/local/bin/start-vnc
@@ -69,7 +90,9 @@ ENV DISPLAY=:0 \
     VNC_PORT=5900 \
     BROWSER_FETCH_ADDR=0.0.0.0:8377 \
     BROWSER_FETCH_CHROME_URL=http://127.0.0.1:9222 \
-    BROWSER_FETCH_LOG_FORMAT=json
+    BROWSER_FETCH_LOG_FORMAT=json \
+    BROWSER_FETCH_HISTORY_COMMAND='["node","/opt/pi-browser/bin/history.ts"]' \
+    PI_BROWSER_HISTORY_CACHE=/tmp/pi-browser-history
 
 EXPOSE 8377 5900
 VOLUME ["/profile"]
