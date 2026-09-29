@@ -252,7 +252,14 @@ func (m *Manager) Run(ctx context.Context, s *Session, a Action) (any, error) {
 	tab := s.tab
 	s.mu.Unlock()
 
-	actx, cancel := context.WithTimeout(ctx, m.opts.ActionTimeout)
+	// Browser commands must run on the tab's chromedp context: chromedp.Run
+	// needs the *Context values (Allocator/Browser/Target) that live in
+	// tab.Ctx(). Deriving the action context from the caller's HTTP request
+	// context yields chromedp.ErrInvalidContext instantly. The request context
+	// still bounds the action: a shorter caller deadline or early disconnect
+	// cancels actx, while ActionTimeout bounds the tab side.
+	actx, cancel, unwatch := m.actionContext(ctx, tab)
+	defer unwatch()
 	defer cancel()
 
 	started := time.Now()
@@ -490,6 +497,27 @@ func actionDetail(a Action) string {
 	return ""
 }
 
+// actionContext derives an action context from the tab's chromedp context,
+// bounded by ActionTimeout. The caller's context (HTTP request) also cancels
+// the action context, so a short request deadline still cuts the action off —
+// without the request context ever being used to execute CDP commands.
+func (m *Manager) actionContext(ctx context.Context, tab Tab) (context.Context, context.CancelFunc, func()) {
+	actx, cancel := context.WithTimeout(tab.Ctx(), m.opts.ActionTimeout)
+	// If the caller's deadline/disconnect fires first, cancel the tab-derived
+	// context so the in-flight CDP command aborts immediately.
+	callerDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-callerDone:
+		}
+	}()
+	return actx, cancel, func() { close(callerDone) }
+}
+
+// dispatch routes one action. The ctx is always derived from tab.Ctx() (see
+// actionContext); dispatchers must not run CDP on any other context.
 func (m *Manager) dispatch(ctx context.Context, s *Session, tab Tab, a Action) (any, error) {
 	switch v := a.(type) {
 	case NavigateAction:
@@ -585,14 +613,37 @@ func (m *Manager) dispatchType(ctx context.Context, s *Session, a TypeAction) er
 	return nil
 }
 
+// actionDeadline reports the remaining budget of an action context (derived
+// from the tab context with the caller's deadline layered on), or 0 when the
+// context carries no deadline.
+func actionDeadline(ctx context.Context) time.Duration {
+	d, ok := ctx.Deadline()
+	if !ok {
+		return 0
+	}
+	return time.Until(d)
+}
+
+// waitBudget picks the wait's own timeout capped by the action deadline when
+// one exists; 0 (no deadline) must not collapse the budget to an instantly
+// expired context.
+func waitBudget(a WaitAction, deadline time.Duration) time.Duration {
+	if deadline <= 0 {
+		return waitTimeout(a)
+	}
+	return min(waitTimeout(a), deadline)
+}
+
 func dispatchWait(ctx context.Context, tab Tab, a WaitAction) error {
 	if a.Selector == "" && a.URLRegexp == "" {
 		return errors.New("wait needs selector or url_regexp")
 	}
 	if a.Selector != "" {
-		tctx, cancel := context.WithTimeout(ctx, waitTimeout(a))
+		// The wait's shorter deadline caps the tab-derived action ctx so a
+		// long selector wait cannot outlive its own budget.
+		tctx, cancel := context.WithTimeout(tab.Ctx(), waitBudget(a, actionDeadline(ctx)))
 		defer cancel()
-		return chromedp.Run(tctx, chromedp.WaitVisible(a.Selector, chromedp.ByQueryAll))
+		return runOn(tctx, chromedp.WaitVisible(a.Selector, chromedp.ByQueryAll))
 	}
 	re, err := regexp.Compile(a.URLRegexp)
 	if err != nil {
