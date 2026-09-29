@@ -120,6 +120,18 @@ func (m *Macro) Validate() error {
 		if a.Kind == "type" && s.Secret == "" && s.Pause == nil {
 			return fmt.Errorf("step %d: type step needs a secret reference", i)
 		}
+		if a.Kind == "autofill" {
+			if a.Text != "" {
+				return fmt.Errorf("step %d: autofill step must reference a fill, not carry a value", i)
+			}
+			var sel struct {
+				Selector string `json:"selector"`
+			}
+			_ = json.Unmarshal(s.Action, &sel)
+			if strings.TrimSpace(sel.Selector) == "" {
+				return fmt.Errorf("step %d: autofill step needs a selector", i)
+			}
+		}
 		if s.Pause != nil && strings.TrimSpace(s.Pause.Reason) == "" {
 			return fmt.Errorf("step %d: pause needs a reason", i)
 		}

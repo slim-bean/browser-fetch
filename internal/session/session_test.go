@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -182,5 +183,57 @@ func TestAssertKinds(t *testing.T) {
 	ar, ok := res.(assertResult)
 	if !ok || !ar.Matched || ar.Count != 1 {
 		t.Fatalf("unexpected landmarks result: %#v", res)
+	}
+}
+
+func TestDispatchAutofillWaitsForFill(t *testing.T) {
+	tab := &fakeTab{ctx: context.Background()}
+	m := New(nil, func(ctx context.Context) (Tab, func(), error) {
+		return tab, func() {}, nil
+	}, Options{MaxSessions: 2, ActionTimeout: 10 * time.Second, AssertTTL: 30 * time.Second})
+	if _, err := m.Open(context.Background(), "example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stub the fill probe: reports "not filled" for the first 2 polls, then filled.
+	calls := 0
+	prev := fieldFilled
+	fieldFilled = func(ctx context.Context, tab Tab, selector string) (bool, error) {
+		calls++
+		return calls >= 3, nil
+	}
+	t.Cleanup(func() { fieldFilled = prev })
+
+	if err := dispatchAutofill(context.Background(), tab, AutofillAction{Selector: "#pw", TimeoutMS: 3000}); err != nil {
+		t.Fatalf("autofill should succeed once the fill arrives: %v", err)
+	}
+	if calls < 3 {
+		t.Fatalf("expected at least 3 polls, got %d", calls)
+	}
+
+	// Never-filled field must fail with the drift error, not hang.
+	fieldFilled = func(ctx context.Context, tab Tab, selector string) (bool, error) {
+		return false, nil
+	}
+	err := dispatchAutofill(context.Background(), tab, AutofillAction{Selector: "#pw", TimeoutMS: 250})
+	if err == nil || !strings.Contains(err.Error(), "never filled") {
+		t.Fatalf("unfilled field must fail with drift error, got: %v", err)
+	}
+
+	// Probe errors are retried until the budget expires, then reported.
+	fieldFilled = func(ctx context.Context, tab Tab, selector string) (bool, error) {
+		return false, errors.New("page navigating")
+	}
+	err = dispatchAutofill(context.Background(), tab, AutofillAction{Selector: "#pw", TimeoutMS: 250})
+	if err == nil || !strings.Contains(err.Error(), "autofill check failed") {
+		t.Fatalf("probe errors must surface after budget, got: %v", err)
+	}
+
+	// Already-filled path passes immediately.
+	fieldFilled = func(ctx context.Context, tab Tab, selector string) (bool, error) {
+		return true, nil
+	}
+	if err := dispatchAutofill(context.Background(), tab, AutofillAction{Selector: "#pw", TimeoutMS: 500}); err != nil {
+		t.Fatalf("already-filled field should pass immediately: %v", err)
 	}
 }

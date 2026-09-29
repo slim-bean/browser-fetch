@@ -80,3 +80,32 @@ func contains(s, sub string) bool {
 		return false
 	})()
 }
+
+func TestAddEventAutofill(t *testing.T) {
+	r := NewRecorder("id", "site.com")
+	if err := r.AddEvent([]byte(`{"ev":"autofill","field":"password","element":{"candidates":["#newPassLogin","div form > input"],"role":"password"},"url":"https://site.com/login"}`)); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	steps := r.Steps()
+	if len(steps) != 1 {
+		t.Fatalf("want 1 step, got %d", len(steps))
+	}
+	var a struct {
+		Kind     string `json:"kind"`
+		Field    string `json:"field"`
+		Selector string `json:"selector"`
+	}
+	if err := json.Unmarshal(steps[0].Action, &a); err != nil {
+		t.Fatal(err)
+	}
+	if a.Kind != "autofill" || a.Field != "password" || a.Selector != "#newPassLogin" {
+		t.Fatalf("autofill step: %s", steps[0].Action)
+	}
+	if steps[0].Secret != "" {
+		t.Fatal("autofill step must not carry a secret reference")
+	}
+	draft, _ := json.Marshal(r.Draft())
+	if contains(string(draft), `"kind":"type"`) {
+		t.Fatalf("autofill must not become a type step:\n%s", draft)
+	}
+}

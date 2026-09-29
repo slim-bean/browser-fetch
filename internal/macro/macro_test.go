@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -132,5 +133,29 @@ func TestHashProfile(t *testing.T) {
 	// Missing profile → error.
 	if _, err := HashProfile(t.TempDir()); err == nil {
 		t.Fatal("missing Local State must error")
+	}
+}
+
+func TestValidateAutofillStep(t *testing.T) {
+	m := &Macro{ID: "m", Site: "s", Steps: []Step{
+		{Action: json.RawMessage(`{"kind":"autofill","field":"password","selector":"#pw"}`)},
+		{Action: json.RawMessage(`{"kind":"click"}`)},
+	}}
+	if err := m.Validate(); err != nil {
+		t.Fatalf("autofill step should validate without a secret: %v", err)
+	}
+	// Autofill carrying a value is refused like type steps.
+	bad := &Macro{ID: "m", Site: "s", Steps: []Step{
+		{Action: json.RawMessage(`{"kind":"autofill","field":"password","selector":"#pw","text":"hunter2"}`)},
+	}}
+	if err := bad.Validate(); err == nil || !strings.Contains(err.Error(), "not carry a value") {
+		t.Fatalf("value-carrying autofill must be refused, got: %v", err)
+	}
+	// Autofill without a selector is refused (replay could not check anything).
+	noSel := &Macro{ID: "m", Site: "s", Steps: []Step{
+		{Action: json.RawMessage(`{"kind":"autofill"}`)},
+	}}
+	if err := noSel.Validate(); err == nil {
+		t.Fatal("autofill without selector must be refused")
 	}
 }

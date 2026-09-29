@@ -16,6 +16,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -419,6 +420,21 @@ type WaitAction struct {
 
 func (WaitAction) Kind() string { return "wait" }
 
+// AutofillAction waits for the browser (not the replay engine) to fill a
+// field — Chrome password-manager autofill, address autofill, or a site's
+// own prefill JS — and then verifies the field actually carries a value.
+// The action never types anything and never reads the value into evidence;
+// it only checks non-emptiness. Drift signal: if the fill stops happening,
+// this fails and replay stops before any submit step.
+type AutofillAction struct {
+	// Selector targets the filled element (CSS, or XPath starting with //).
+	Selector string `json:"selector"`
+	// TimeoutMS bounds the wait; 0 uses the default (5s).
+	TimeoutMS int64 `json:"timeout_ms,omitempty"`
+}
+
+func (AutofillAction) Kind() string { return "autofill" }
+
 // ScreenshotAction captures the viewport as PNG.
 type ScreenshotAction struct {
 	// FullPage captures beyond the viewport.
@@ -541,6 +557,8 @@ func (m *Manager) dispatch(ctx context.Context, s *Session, tab Tab, a Action) (
 		return dispatchDownload(ctx, tab, v)
 	case AssertAction:
 		return dispatchAssert(ctx, tab, v)
+	case AutofillAction:
+		return nil, dispatchAutofill(ctx, tab, v)
 	default:
 		return nil, fmt.Errorf("unknown action kind %T", a)
 	}
@@ -755,6 +773,60 @@ func dispatchAssert(ctx context.Context, tab Tab, a AssertAction) (any, error) {
 	default:
 		return nil, fmt.Errorf("unknown assert kind %q", a.AssertKind)
 	}
+}
+
+// dispatchAutofill polls the field's .value via Runtime.evaluate until it is
+// non-empty or the budget expires. The value itself is never returned or
+// logged — only presence/absence — so no secret material reaches evidence.
+func dispatchAutofill(ctx context.Context, tab Tab, a AutofillAction) error {
+	if a.Selector == "" {
+		return errors.New("autofill needs selector")
+	}
+	timeout := a.TimeoutMS
+	if timeout <= 0 {
+		timeout = 5000
+	}
+	deadline := time.Now().Add(time.Duration(timeout) * time.Millisecond)
+	for {
+		filled, err := fieldFilled(ctx, tab, a.Selector)
+		if err == nil && filled {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				return fmt.Errorf("autofill check failed for %q: %w", a.Selector, err)
+			}
+			return fmt.Errorf("field %q was never filled (autofill did not arrive in %dms)", a.Selector, timeout)
+		}
+		if err := sleepCtx(ctx, 100*time.Millisecond); err != nil {
+			return err
+		}
+	}
+}
+
+// fieldFilled reports whether the element currently carries a value. A package
+// var so tests can stub the browser; production evaluates JS in the page.
+// Errors mean "cannot tell this poll" and keep the outer loop polling.
+var fieldFilled = func(ctx context.Context, tab Tab, selector string) (bool, error) {
+	var res any
+	tctx, cancel := context.WithTimeout(tab.Ctx(), 2*time.Second)
+	defer cancel()
+	err := runOn(tctx,
+		chromedp.Evaluate(
+			`(() => { const el = document.querySelector(`+jsQuote(selector)+`); if (!el) return null; const v = ("value" in el) ? el.value : el.textContent; return v === "" ? null : true; })()`,
+			&res,
+		))
+	if err != nil {
+		return false, err
+	}
+	filled, _ := res.(bool)
+	return filled, nil
+}
+
+// jsQuote renders a Go string as a JavaScript single-quoted string literal.
+func jsQuote(s string) string {
+	b, _ := json.Marshal(s) // JSON string is a valid JS string literal
+	return string(b)
 }
 
 type assertResult struct {
