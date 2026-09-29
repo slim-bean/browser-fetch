@@ -2,11 +2,16 @@ package browser
 
 import (
 	"context"
+	"time"
 
 	cdppage "github.com/chromedp/cdproto/page"
 	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
+
+// installTimeout bounds the recorder's own install round-trips, independent of
+// any caller deadline.
+const installTimeout = 10 * time.Second
 
 // Snapshot is one atomic read of a page's identity and markup.
 type Snapshot = snapshot
@@ -58,7 +63,13 @@ func (t *SessionTab) StartRecorder(ctx context.Context, script, binding string) 
 			}
 		}
 	})
-	err := chromedp.Run(ctx,
+	// The recorder installs browser-domain commands on the tab's chromedp
+	// context; ctx (the HTTP request) only cancels the install early.
+	installCtx, cancel := context.WithTimeout(t.p.ctx, installTimeout)
+	defer cancel()
+	unwatch := watch(ctx, cancel)
+	defer unwatch()
+	err := chromedp.Run(installCtx,
 		runtime.AddBinding(binding),
 		chromedp.ActionFunc(func(ctx context.Context) error {
 			_, err := cdppage.AddScriptToEvaluateOnNewDocument(script).Do(ctx)

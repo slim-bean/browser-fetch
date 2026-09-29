@@ -42,6 +42,23 @@ type DownloadResult struct {
 	ContentBase64 string `json:"content_base64"`
 }
 
+// downloadCommandContext derives a context from the tab's chromedp context
+// for the download's command phase (SetDownloadBehavior + trigger click). The
+// caller's context (HTTP request) still cancels it early; the wait loop after
+// the commands continues to use the caller's ctx.
+func downloadCommandContext(ctx context.Context, tab Tab) (context.Context, context.CancelFunc, func()) {
+	cmdCtx, cancel := context.WithTimeout(tab.Ctx(), 30*time.Second)
+	callerDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			cancel()
+		case <-callerDone:
+		}
+	}()
+	return cmdCtx, cancel, func() { close(callerDone) }
+}
+
 func dispatchDownload(ctx context.Context, tab Tab, a DownloadAction) (any, error) {
 	if a.ClickSelector == "" && a.FilenameRegexp == "" {
 		// Without a click we cannot know which download to wait for; require
@@ -81,13 +98,19 @@ func dispatchDownload(ctx context.Context, tab Tab, a DownloadAction) (any, erro
 		}
 	})
 
-	if err := runOn(ctx, browser.SetDownloadBehavior("allowAndName").
+	// Browser-domain commands (SetDownloadBehavior) and the trigger click run
+	// on the tab's chromedp context; ctx only bounds the wait loop below.
+	cmdCtx, cancelCmd, unwatch := downloadCommandContext(ctx, tab)
+	defer unwatch()
+	defer cancelCmd()
+
+	if err := runOn(cmdCtx, browser.SetDownloadBehavior("allowAndName").
 		WithDownloadPath(dir).WithEventsEnabled(true)); err != nil {
 		return nil, fmt.Errorf("set download behavior: %w", err)
 	}
 
 	if a.ClickSelector != "" {
-		if err := runOn(ctx, chromedp.Click(a.ClickSelector, chromedp.ByQueryAll, chromedp.NodeVisible)); err != nil {
+		if err := runOn(cmdCtx, chromedp.Click(a.ClickSelector, chromedp.ByQueryAll, chromedp.NodeVisible)); err != nil {
 			return nil, fmt.Errorf("download trigger click: %w", err)
 		}
 	}
