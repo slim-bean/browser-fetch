@@ -90,16 +90,33 @@ const CaptureScript = `(() => {
   // Change events (text inputs, selects). NEVER send the value for password
   // fields; for text inputs the recorded flow only needs the field identity —
   // values are resolved from the secret store at replay time.
+  // Chrome password-manager autofill sets field values programmatically and
+  // fires trusted 'change' events exactly like a human edit, so a naive
+  // change listener records autofill as typing. Distinguish them: track
+  // recent real key events per element; a change on an element that saw no
+  // keystrokes is a fill. Fills become 'autofill' events (replay waits for
+  // the field to carry a value and asserts it) — never 'type' steps, which
+  // require a secret reference by policy.
+  const typed = new WeakMap(); // element -> true after a real keystroke
+  const lastKey = { t: 0 };
+  document.addEventListener('keydown', () => { lastKey.t = Date.now(); }, true);
   document.addEventListener('change', (ev) => {
     const el = ev.target;
     if (!el || !el.tagName) return;
     const tag = el.tagName.toLowerCase();
     if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return;
+    if (el.type === 'hidden') return;
+    const humanTyped = typed.get(el) || (Date.now() - lastKey.t) < 1500;
+    typed.set(el, humanTyped);
+    const field = el.type === 'password' ? 'password' : 'text';
+    if (!humanTyped) {
+      send({ ev: 'autofill', field: field, element: describe(el), url: url(), at: at() });
+      return;
+    }
     if (el.type === 'password') {
       send({ ev: 'type', field: 'password', element: describe(el), url: url(), at: at() });
       return;
     }
-    if (el.type === 'hidden') return;
     send({ ev: 'type', field: 'text', element: describe(el), url: url(), at: at() });
   }, true);
 
@@ -114,7 +131,7 @@ const BindingName = "__bfRecord"
 
 // Event is one decoded binding payload.
 type Event struct {
-	Ev      string   `json:"ev"`
+	Ev      string   `json:"ev"` // click | type | submit | autofill | nav
 	Field   string   `json:"field,omitempty"`
 	Element *Element `json:"element,omitempty"`
 	URL     string   `json:"url,omitempty"`
@@ -147,6 +164,14 @@ func (r *Recorder) AddEvent(payload []byte) error {
 		step = Step{Action: json.RawMessage(`{"kind":"type","field":"` + e.Field + `"}`), Recorded: rec}
 	case "submit":
 		step = Step{Action: json.RawMessage(`{"kind":"click"}`), Recorded: rec}
+	case "autofill":
+		// A programmatic fill (Chrome password manager et al). Recorded so
+		// replay can assert the field is actually filled — if the fill ever
+		// stops happening, replay stops instead of submitting an empty form.
+		// The step's selector is the recorded element's best candidate.
+		step = Step{Action: json.RawMessage(
+			`{"kind":"autofill","field":"` + e.Field + `","selector":` + selectorJSON(e.Element) + `}`),
+			Recorded: rec}
 	default:
 		return fmt.Errorf("unknown recorder event %q", e.Ev)
 	}
@@ -179,4 +204,14 @@ func (r *Recorder) Draft() *Macro {
 // recorder package stays dependency-light in tests.
 type Runner interface {
 	Run(ctx context.Context, m *Macro) error
+}
+
+// selectorJSON picks the strongest recorded candidate as the replay selector
+// and returns it as a JSON string (empty string when nothing was described).
+func selectorJSON(e *Element) string {
+	if e == nil || len(e.Candidates) == 0 {
+		return `""`
+	}
+	c, _ := json.Marshal(e.Candidates[0])
+	return string(c)
 }

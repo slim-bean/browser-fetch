@@ -98,6 +98,8 @@ func (r *Replayer) runStep(ctx context.Context, exec Executor, sess *session.Ses
 		return r.runType(ctx, exec, sess, i, step)
 	case "click":
 		return r.runClick(ctx, exec, sess, i, step)
+	case "autofill":
+		return r.runAutofill(ctx, exec, sess, i, step)
 	case "navigate", "wait", "assert", "screenshot", "content", "download":
 		action, err := decodeMacroAction(step.Action)
 		if err != nil {
@@ -131,6 +133,9 @@ func decodeMacroAction(raw json.RawMessage) (session.Action, error) {
 		return a, json.Unmarshal(raw, &a)
 	case "type":
 		var a session.TypeAction
+		return a, json.Unmarshal(raw, &a)
+	case "autofill":
+		var a session.AutofillAction
 		return a, json.Unmarshal(raw, &a)
 	case "wait":
 		var a session.WaitAction
@@ -203,6 +208,25 @@ func (r *Replayer) runType(ctx context.Context, exec Executor, sess *session.Ses
 	a.Text = value
 	if _, err := exec.Run(ctx, sess, a); err != nil {
 		return &ReplayError{Step: i, Kind: "type", Cause: err.Error()}
+	}
+	return nil
+}
+
+// runAutofill handles a programmatic fill (e.g. Chrome password manager).
+// Replay types nothing: it waits for the browser to fill the field and
+// verifies the field carries a value before the flow continues. If the fill
+// never arrives (autofill disabled, profile moved, site markup changed),
+// replay aborts rather than proceeding with an empty form.
+func (r *Replayer) runAutofill(ctx context.Context, exec Executor, sess *session.Session, i int, step Step) error {
+	var a session.AutofillAction
+	if err := json.Unmarshal(step.Action, &a); err != nil {
+		return &ReplayError{Step: i, Kind: "autofill", Cause: err.Error()}
+	}
+	if a.Selector == "" {
+		return &ReplayError{Step: i, Kind: "autofill", Cause: "autofill step lacks selector"}
+	}
+	if _, err := exec.Run(ctx, sess, a); err != nil {
+		return &ReplayError{Step: i, Kind: "autofill", Cause: err.Error()}
 	}
 	return nil
 }
