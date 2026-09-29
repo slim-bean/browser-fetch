@@ -101,6 +101,18 @@ spec:
                   name: browser-fetch
                   key: reader-token
                   optional: true
+            # Human-only macro admin band (approve/revoke/edit/delete). The
+            # listener stays OFF unless both vars are set; the admin token
+            # must differ from every agent-facing token (config.Validate
+            # refuses to start otherwise). Hold it out of the agent's env.
+            - name: BROWSER_FETCH_ADMIN_ADDR
+              value: ":8081"
+            - name: BROWSER_FETCH_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: browser-fetch
+                  key: admin-token
+                  optional: true
             - name: VNC_PASSWORD
               valueFrom:
                 secretKeyRef:

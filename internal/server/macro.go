@@ -200,8 +200,16 @@ func (s *Server) handleMacroRecordStop(w http.ResponseWriter, r *http.Request) {
 	draft := live.rec.Draft()
 	draft.Description = req.Description
 	if err := s.macros.store.Put(draft, false); err != nil {
-		log.Warn("macro draft store failed", "err", err)
-		writeJSON(w, http.StatusInternalServerError, errorBody{Error: err.Error(), Code: "macro_store_failed"})
+		log.Warn("macro draft store failed", "err", err, "macro", req.MacroID, "steps", len(draft.Steps))
+		// The draft must not be lost: the human's clicks are irreplaceable.
+		// Park it as <id>.orphan.json (0600) so the admin band can recover it.
+		if orphanErr := s.macros.store.PutOrphan(draft); orphanErr == nil {
+			log.Info("draft parked for admin recovery", "macro", req.MacroID)
+		}
+		writeJSON(w, http.StatusInternalServerError, errorBody{
+			Error: err.Error() + " (draft parked in the macro store for admin recovery)",
+			Code:  "macro_store_failed",
+		})
 		return
 	}
 	if req.CloseSession == nil || *req.CloseSession {
@@ -266,34 +274,23 @@ func (s *Server) handleMacroGet(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, m)
 }
 
-type approveRequest struct {
-	MacroID string `json:"macro_id"`
-	By      string `json:"by"`
-}
-
-func (s *Server) handleMacroApprove(w http.ResponseWriter, r *http.Request) {
-	log := logx.From(r.Context())
-	if !s.requireMacros(w) {
-		return
-	}
-	var req approveRequest
-	if err := decodeBody(r, &req); err != nil {
-		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error(), Code: "bad_request"})
-		return
-	}
-	if req.By == "" {
-		req.By = "operator"
-	}
-	if err := s.macros.store.Approve(req.MacroID, req.By); err != nil {
-		log.Warn("macro approve failed", "err", err)
-		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error(), Code: "bad_request"})
-		return
-	}
-	log.Info("macro approved", "macro", req.MacroID, "by", req.By)
-	writeJSON(w, http.StatusOK, map[string]any{"macro_id": req.MacroID, "approved": true})
+// handleAgentApproveGone serves the old approval route. Approval moved to
+// the human-only admin band (internal/server/admin.go): an approve endpoint
+// on the agent-facing surface would make the approval stamp meaningless —
+// the agent could grant itself authority.
+func (s *Server) handleAgentApproveGone(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusGone, errorBody{
+		Error: "macro approval moved to the human-only admin band (-admin-addr); the agent cannot approve",
+		Code:  "approval_requires_admin_band",
+	})
 }
 
 // ---- replay ---------------------------------------------------------------------
+// Approval used to be handled here (POST /macro/approve with {macro_id, by}).
+// It moved to the human-only admin band (internal/server/admin.go): an
+// approve endpoint on the agent-facing surface would make the approval stamp
+// meaningless — the agent could grant itself authority. The route now serves
+// 410 (see server.go).
 
 type replayRequest struct {
 	MacroID   string `json:"macro_id"`
@@ -336,6 +333,16 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 	}
 	started := time.Now()
 	runErr := re.Run(r.Context(), s.sessions, sess, m)
+	defer func() {
+		aborted, cause := -1, ""
+		var reErr *macro.ReplayError
+		if errors.As(runErr, &reErr) {
+			aborted, cause = reErr.Step, reErr.Cause
+		} else if runErr != nil {
+			cause = runErr.Error()
+		}
+		s.admin.RecordReplay(m.ID, runErr == nil, time.Since(started), aborted, cause)
+	}()
 
 	result := map[string]any{
 		"macro_id":    m.ID,

@@ -86,31 +86,9 @@ func run() error {
 	}
 	cancelProbe()
 
-	srv := &http.Server{
-		Addr:              cfg.Addr,
-		Handler:           server.New(cfg, log, mgr).Handler(),
-		ReadHeaderTimeout: 10 * time.Second,
-		// Long enough for assist mode, where a human clicks a challenge.
-		WriteTimeout: cfg.RequestTimeout + cfg.AssistTimeout + 30*time.Second,
-		IdleTimeout:  90 * time.Second,
+	err = server.Serve(cfg, log, mgr)
+	if errors.Is(err, http.ErrServerClosed) {
+		err = nil
 	}
-
-	errc := make(chan error, 1)
-	go func() {
-		log.Info("listening", "addr", cfg.Addr)
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errc <- err
-		}
-	}()
-
-	select {
-	case err := <-errc:
-		return err
-	case <-ctx.Done():
-		log.Info("shutting down")
-	}
-
-	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return srv.Shutdown(shutCtx)
+	return err
 }
