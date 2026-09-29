@@ -109,3 +109,40 @@ func TestAddEventAutofill(t *testing.T) {
 		t.Fatalf("autofill must not become a type step:\n%s", draft)
 	}
 }
+
+// Regression: tirerack.com live run 2026-09-29. Ed dismissed a popup with a
+// keypress (Escape/Enter); Chrome autofilled the login form within the old
+// script's 1500ms any-key window, so the fill was misclassified as a type
+// step at step 0 and the validator refused the draft. Classification must be
+// per-element real text entry, never a global keystroke timer.
+func TestAddEventKeypressBeforeAutofillIsNotTyping(t *testing.T) {
+	r := NewRecorder("id", "site.com")
+	// Capture script must not contain a global timing window on lastKey.
+	script := CaptureScript
+	if contains(script, "lastKey") {
+		t.Fatal("capture script still keys classification off a global keystroke timer")
+	}
+	if !contains(script, "isTrusted") || !contains(script, "WeakMap") {
+		t.Fatal("capture script must classify via trusted per-element keystroke tracking")
+	}
+	// Any keydown before autofill without text entry on the field itself is a fill.
+	// The fill path is exercised in TestAddEventAutofill; here the assertion
+	// is that the SCRIPT can no longer misclassify: classification is
+	// per-element trusted text entry, with no global keystroke timer.
+	if err := r.AddEvent([]byte(`{"ev":"autofill","field":"text","element":{"candidates":["#newEmailLogin"]}}`)); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	steps := r.Steps()
+	if len(steps) != 1 {
+		t.Fatalf("want 1 step, got %d", len(steps))
+	}
+	var a struct {
+		Kind string `json:"kind"`
+	}
+	if err := json.Unmarshal(steps[0].Action, &a); err != nil {
+		t.Fatal(err)
+	}
+	if a.Kind != "autofill" {
+		t.Fatalf("keyless fill must stay autofill, got %s", steps[0].Action)
+	}
+}

@@ -97,16 +97,29 @@ const CaptureScript = `(() => {
   // keystrokes is a fill. Fills become 'autofill' events (replay waits for
   // the field to carry a value and asserts it) — never 'type' steps, which
   // require a secret reference by policy.
-  const typed = new WeakMap(); // element -> true after a real keystroke
-  const lastKey = { t: 0 };
-  document.addEventListener('keydown', () => { lastKey.t = Date.now(); }, true);
+  // An element counts as human-typed only after a REAL printable/editing
+  // keystroke ON THAT ELEMENT. Any-key timing windows are wrong: pressing
+  // Escape/Tab anywhere (e.g. dismissing a popup) must not make an autofill
+  // that fires a second later look like typing, and selecting a checkbox
+  // with Space fires change without being a text edit.
+  const typed = new WeakMap(); // element -> true after a real text keystroke on it
+  document.addEventListener('keydown', (ev) => {
+    if (!ev.isTrusted) return;
+    const k = ev.key;
+    // Only printable characters count as text entry. Enter/Tab/Escape and
+    // friends are navigation, not typing; Space on a checkbox is selection.
+    if (k && k.length === 1 && k !== ' ') typed.set(ev.target, true);
+  }, true);
+  document.addEventListener('beforeinput', (ev) => {
+    if (ev.isTrusted && ev.inputType && ev.inputType.startsWith('insert')) typed.set(ev.target, true);
+  }, true);
   document.addEventListener('change', (ev) => {
     const el = ev.target;
     if (!el || !el.tagName) return;
     const tag = el.tagName.toLowerCase();
     if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return;
     if (el.type === 'hidden') return;
-    const humanTyped = typed.get(el) || (Date.now() - lastKey.t) < 1500;
+    const humanTyped = !!typed.get(el);
     typed.set(el, humanTyped);
     const field = el.type === 'password' ? 'password' : 'text';
     if (!humanTyped) {
