@@ -117,7 +117,11 @@ func (s *Server) handleMacroRecordStart(w http.ResponseWriter, r *http.Request) 
 		}
 	}
 
-	events, err := sess.StartRecording(r.Context(), macro.CaptureScript, macro.BindingName)
+	// Install on a context that outlives this HTTP request: the binding and
+	// its ListenTarget subscription stay active for the whole recording
+	// session, not just this handler's lifetime. The recorder's own
+	// installTimeout bounds the install; install failure is reported here.
+	events, err := sess.StartRecording(context.Background(), macro.CaptureScript, macro.BindingName)
 	if err != nil {
 		if req.SessionID == "" {
 			_ = s.sessions.Close(sess.ID)
@@ -129,7 +133,11 @@ func (s *Server) handleMacroRecordStart(w http.ResponseWriter, r *http.Request) 
 
 	sess.SetHold(true) // a human is driving; do not idle-reap
 	rec := macro.NewRecorder(req.MacroID, req.Site)
-	ctx, cancel := context.WithCancel(r.Context())
+	// The event drain must outlive the record/start HTTP request: the human
+	// clicks in a VNC browser long after this handler returns, so a context
+	// derived from r.Context() would cancel the drain immediately and every
+	// macro would stop with "no steps".
+	ctx, cancel := context.WithCancel(context.Background())
 	live := &recording{macroID: req.MacroID, sessionID: sess.ID, rec: rec, cancel: cancel}
 
 	// Drain capture events into the recorder for the recording's lifetime.
