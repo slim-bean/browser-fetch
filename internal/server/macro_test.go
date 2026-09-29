@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/slim-bean/browser-fetch/internal/macro"
+	"github.com/slim-bean/browser-fetch/internal/session"
 )
 
 func testServerWithMacros(t *testing.T) (*Server, *macroState) {
@@ -146,4 +148,70 @@ func mustJSON(t *testing.T, method, path string, body any) *http.Request {
 		t.Fatal(err)
 	}
 	return httptest.NewRequest(method, path, bytes.NewReader(b))
+}
+
+// recordingTab is a Tab whose StartRecording returns a channel the test
+// controls, simulating the page-side capture binding.
+type recordingTab struct {
+	events chan string
+}
+
+func (t recordingTab) Ctx() context.Context { return context.Background() }
+func (t recordingTab) Read(ctx context.Context) (session.Snapshot, error) {
+	return session.Snapshot{}, nil
+}
+func (t recordingTab) StartRecorder(ctx context.Context, script, binding string) (<-chan string, error) {
+	return t.events, nil
+}
+
+// Regression (PR #4): events must still be captured after the record/start
+// HTTP request has completed. The original bug tied the event drain to the
+// request context, so a human clicking on VNC seconds later recorded nothing
+// and record/stop discarded the draft with "macro has no steps".
+func TestRecordCaptureOutlivesStartRequest(t *testing.T) {
+	s, ms := testServerWithMacros(t)
+	events := make(chan string, 8)
+	tab := recordingTab{events: events}
+
+	sm := session.New(slog.New(slog.DiscardHandler), func(ctx context.Context) (session.Tab, func(), error) {
+		return tab, func() {}, nil
+	}, session.Options{MaxSessions: 2})
+	s.sessions = sm
+
+	sess, err := sm.Open(context.Background(), "example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// record/start; use a request context we cancel immediately to prove the
+	// drain survives the handler's own request ending.
+	startCtx, cancelStart := context.WithCancel(context.Background())
+	req := mustJSON(t, "POST", "/macro/record/start", map[string]string{
+		"macro_id": "m-live", "site": "example.com", "session_id": sess.ID,
+	}).WithContext(startCtx)
+	w := httptest.NewRecorder()
+	s.handleMacroRecordStart(w, req)
+	cancelStart() // the HTTP request completes (client gone)
+	if w.Code != 200 {
+		t.Fatalf("record/start: %d %s", w.Code, w.Body.String())
+	}
+
+	// The human clicks AFTER the start request is done.
+	events <- `{"ev":"click","element":{"candidates":["#login"],"role":"button","text":"Sign in"},"url":"https://example.com/"}`
+	// Allow the drain goroutine to ingest the event.
+	time.Sleep(100 * time.Millisecond)
+
+	// record/stop must persist a draft WITH steps (not "macro has no steps").
+	w = httptest.NewRecorder()
+	s.handleMacroRecordStop(w, mustJSON(t, "POST", "/macro/record/stop", map[string]any{"macro_id": "m-live", "close_session": false}))
+	if w.Code != 200 {
+		t.Fatalf("record/stop: %d %s", w.Code, w.Body.String())
+	}
+	stored, err := ms.store.Get("m-live")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stored.Steps) != 1 {
+		t.Fatalf("draft must capture the post-request click, got %d steps", len(stored.Steps))
+	}
 }
