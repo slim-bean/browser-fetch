@@ -11,6 +11,28 @@ sequence came from a human, not from an LLM.
 Trust chain: human interaction → recorded macro → **human review/approval** →
 deterministic replay with drift detection → evidence log per step.
 
+Approval authority lives on a **separate admin band** the agent cannot reach:
+
+- a second HTTP listener (`-admin-addr` / `BROWSER_FETCH_ADMIN_ADDR`, default
+  off) serving a token-gated, server-rendered UI (no JavaScript) at which the
+  human reviews each step's recorded context and then approves, revokes,
+  edits (drop/reorder steps), or deletes macros;
+- its own bearer token (`-admin-token` / `BROWSER_FETCH_ADMIN_TOKEN`) which
+  must differ from every agent-facing token — the gateway refuses to start
+  the band otherwise;
+- the agent-facing `POST /macro/approve` is **removed** (410 Gone): approval
+  the agent could grant or forge would certify nothing. There is no agent
+  edit endpoint at all. The agent keeps read access (macros carry no values),
+  record start/stop (drafts are inert until approved), and replay of approved
+  macros;
+- any edit of an approved macro clears its approval — an approval certifies
+  the exact step list;
+- failed draft stores park the recording as `<id>.orphan.json` (0600) so the
+  human's clicks are never lost; the admin band can recover or discard parked
+  drafts, and refuses to promote an orphan over an approved macro;
+- the agent-facing replay handler reports outcomes into an admin-band
+  dashboard ring so the human sees every replay (and every abort) that ran.
+
 ## Macro file format
 
 ```json
@@ -68,7 +90,9 @@ that Ed approves; runtime stays deterministic.
   held open (not idle-reaped) while the human drives.
 - `GET /macros` — all stored macros with approval status (driver token).
 - `GET /macro?id=…` — full macro JSON for human review (driver token).
-- `POST /macro/approve` — human approves `{macro_id, by}` → replayable.
+- `POST /macro/approve` — **removed (410)**. Approval happens only in the
+  human-only admin band (`-admin-addr`): dashboard at `/`, per-macro step
+  review at `/macro?id=…`, actions by HTML form post.
 - `POST /macro/replay` — driver token; runs an approved macro in a session,
   producing the same per-step evidence log. Response includes `evidence`
   (the session action log) and, on abort, `aborted_at_step`, `step_kind`,

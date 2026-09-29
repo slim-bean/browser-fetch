@@ -15,6 +15,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -22,7 +23,9 @@ import (
 	"net/http/pprof"
 	neturl "net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -50,6 +53,7 @@ type Server struct {
 	met          *metrics.Metrics
 	sessions     *session.Manager
 	macros       *macroState
+	admin        *Admin // human-only macro admin band; nil when disabled
 	secrets      macro.SecretResolver
 	start        time.Time
 	historySlots chan struct{}
@@ -88,6 +92,9 @@ func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
 		log.Error("macro store unavailable; macro endpoints disabled", "dir", cfg.MacroStore, "err", msErr)
 	} else {
 		s.macros = ms
+		if cfg.AdminAddr != "" {
+			s.admin = NewAdmin(ms.store, cfg.AdminToken)
+		}
 	}
 	go s.sessionsReaper()
 	s.met = metrics.New(metrics.Sources{
@@ -147,7 +154,11 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /session/log", s.routeDriver("session_log", s.handleSessionLog))
 	mux.Handle("POST /macro/record/start", s.routeDriver("macro_record_start", s.handleMacroRecordStart))
 	mux.Handle("POST /macro/record/stop", s.routeDriver("macro_record_stop", s.handleMacroRecordStop))
-	mux.Handle("POST /macro/approve", s.routeDriver("macro_approve", s.handleMacroApprove))
+	// Approval used to live here. It moved to the human-only admin band (a
+	// separate listener on -admin-addr): an approve endpoint the agent could
+	// call would make the approval stamp meaningless. 410 tells old clients
+	// the authority is gone by design, not temporarily.
+	mux.Handle("POST /macro/approve", s.routeDriver("macro_approve", s.handleAgentApproveGone))
 	mux.Handle("POST /macro/replay", s.routeDriver("macro_replay", s.handleMacroReplay))
 	mux.Handle("POST /macro/resume", s.routeDriver("macro_resume", s.handleMacroResume))
 	mux.Handle("GET /macros", s.routeDriver("macros", s.handleMacroList))
@@ -316,6 +327,61 @@ func (s *Server) sessionsReaper() {
 	for range t.C {
 		s.sessions.Reap()
 	}
+}
+
+// Serve runs the gateway's listeners until the context is cancelled: the
+// main agent-facing API, plus — when configured — the human-only admin band
+// on its own address. The admin listener shares the main shutdown.
+func Serve(cfg config.Config, log *slog.Logger, mgr *browser.Manager) error {
+	s := New(cfg, log, mgr)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	build := func(addr string, h http.Handler) *http.Server {
+		return &http.Server{
+			Addr:              addr,
+			Handler:           h,
+			ReadHeaderTimeout: 10 * time.Second,
+			// Long enough for assist mode, where a human clicks a challenge.
+			WriteTimeout: cfg.RequestTimeout + cfg.AssistTimeout + 30*time.Second,
+			IdleTimeout:  90 * time.Second,
+		}
+	}
+
+	type listener struct {
+		srv  *http.Server
+		name string
+	}
+	listeners := []listener{{build(cfg.Addr, s.Handler()), "gateway"}}
+	if cfg.AdminAddr != "" && s.admin != nil {
+		listeners = append(listeners, listener{build(cfg.AdminAddr, s.admin.Handler()), "admin"})
+		log.Info("admin band listening", "addr", cfg.AdminAddr,
+			"note", "human-only macro approve/revoke/edit/delete")
+	}
+
+	errc := make(chan error, len(listeners))
+	for _, l := range listeners {
+		go func(l listener) {
+			log.Info("listening", "addr", l.srv.Addr, "band", l.name)
+			if err := l.srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errc <- err
+			}
+		}(l)
+	}
+
+	select {
+	case err := <-errc:
+		return err
+	case <-ctx.Done():
+		log.Info("shutting down")
+	}
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, l := range listeners {
+		_ = l.srv.Shutdown(shutCtx)
+	}
+	return nil
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {

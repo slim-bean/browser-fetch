@@ -97,6 +97,13 @@ type Config struct {
 	// MacroStore is the directory macro recordings are persisted to. Empty =
 	// macro endpoints disabled.
 	MacroStore string
+	// AdminAddr is the listen address for the human-only admin band (macro
+	// approve/revoke/edit/delete). Empty = admin band disabled.
+	AdminAddr string
+	// AdminToken is the bearer token for the admin band. It MUST differ from
+	// every agent-facing token: the admin band is the only path to approval
+	// authority, and it must be unreachable by the agent.
+	AdminToken string
 
 	LogFormat string // text|json
 	LogLevel  string // debug|info|warn|error
@@ -171,6 +178,8 @@ func Load(args []string) (Config, error) {
 	envStr("BROWSER_FETCH_HISTORY_ROOT", &c.HistoryRoot)
 	envStr("BROWSER_FETCH_HISTORY_SOURCE", &c.HistorySource)
 	envStr("BROWSER_FETCH_MACRO_STORE", &c.MacroStore)
+	envStr("BROWSER_FETCH_ADMIN_ADDR", &c.AdminAddr)
+	envStr("BROWSER_FETCH_ADMIN_TOKEN", &c.AdminToken)
 	envStr("BROWSER_FETCH_PUBLIC_URL", &c.PublicURL)
 	if err := envBool("BROWSER_FETCH_ENABLE_CDP", &c.EnableCDP); err != nil {
 		return c, err
@@ -186,6 +195,8 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&c.ReaderToken, "reader-token", c.ReaderToken, "restricted token: /fetch only, no sessions")
 	fs.Var(&hostList{&c.AllowHosts}, "allow-hosts", "comma-separated hosts sessions may navigate to")
 	fs.StringVar(&c.MacroStore, "macro-store", c.MacroStore, "directory for macro recordings (empty disables macro endpoints)")
+	fs.StringVar(&c.AdminAddr, "admin-addr", c.AdminAddr, "listen address for the human-only macro admin band (empty disables)")
+	fs.StringVar(&c.AdminToken, "admin-token", c.AdminToken, "bearer token for the admin band; must differ from agent tokens")
 	fs.BoolVar(&c.AllowNoToken, "allow-no-token", c.AllowNoToken, "start without a token (local only)")
 	fs.StringVar(&c.ChromeURL, "chrome-url", c.ChromeURL, "Chrome DevTools endpoint")
 	fs.IntVar(&c.MaxTabs, "max-tabs", c.MaxTabs, "max concurrent navigations")
@@ -252,6 +263,17 @@ func (c Config) validate() error {
 	}
 	if c.ReaderToken != "" && (c.ReaderToken == c.Token || c.ReaderToken == c.DriverToken) {
 		return errors.New("reader-token must differ from the other tokens")
+	}
+	if c.AdminAddr != "" {
+		if c.MacroStore == "" {
+			return errors.New("admin band requires macro-store to be set")
+		}
+		if c.AdminToken == "" {
+			return errors.New("admin band requires an admin-token")
+		}
+		if c.AdminToken == c.Token || c.AdminToken == c.DriverToken || c.AdminToken == c.ReaderToken {
+			return errors.New("admin-token must differ from every agent-facing token")
+		}
 	}
 	return nil
 }

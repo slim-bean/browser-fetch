@@ -224,7 +224,10 @@ func (s *Store) List() ([]string, error) {
 	}
 	var ids []string
 	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+		// .orphan.json files are parked drafts, not macros; they surface via
+		// ListOrphans in the admin band only.
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") ||
+			strings.HasSuffix(e.Name(), ".orphan.json") {
 			continue
 		}
 		ids = append(ids, strings.TrimSuffix(e.Name(), ".json"))
@@ -233,11 +236,132 @@ func (s *Store) List() ([]string, error) {
 	return ids, nil
 }
 
+// Update loads a macro, applies mutate, re-validates and persists atomically.
+// Any edit clears the approval stamp: approval certifies the exact step
+// list, so a mutated macro is a draft again and needs fresh sign-off. This
+// is the only sanctioned mutation path and it lives behind the admin band.
+func (s *Store) Update(id string, mutate func(*Macro)) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, err := s.getLocked(id)
+	if err != nil {
+		return err
+	}
+	mutate(m)
+	m.Approved = nil // an edited macro is unapproved by definition
+	if err := m.Validate(); err != nil {
+		return err
+	}
+	return s.writeLocked(m)
+}
+
+// Revoke clears the approval stamp without touching steps. The macro returns
+// to draft; replay refuses it immediately.
+func (s *Store) Revoke(id string) error {
+	return s.Update(id, func(m *Macro) {})
+}
+
+// Delete removes a macro's file. Used by the human admin band only.
+func (s *Store) Delete(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	path := s.path(id)
+	if _, err := os.Stat(path); err != nil {
+		return fmt.Errorf("macro %q: %w", id, os.ErrNotExist)
+	}
+	return os.Remove(path)
+}
+
+// PutOrphan parks a draft that failed to store (e.g. it failed validation or
+// the id collided with an approved macro) as <sanitized-id>.orphan.json.
+// The steps are the human's work and must not be silently discarded; the
+// admin band lists orphans so a human can recover or delete them.
+func (s *Store) PutOrphan(m *Macro) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	buf, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	base := filepath.Join(s.dir, sanitizeID(m.ID))
+	tmp := base + ".orphan.json.tmp"
+	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, base+".orphan.json")
+}
+
+// ListOrphans returns the ids of parked drafts (id part before .orphan.json).
+func (s *Store) ListOrphans() ([]string, error) {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, e := range entries {
+		const suffix = ".orphan.json"
+		if e.IsDir() || !strings.HasSuffix(e.Name(), suffix) {
+			continue
+		}
+		ids = append(ids, strings.TrimSuffix(e.Name(), suffix))
+	}
+	sort.Strings(ids)
+	return ids, nil
+}
+
+// GetOrphan loads a parked draft.
+func (s *Store) GetOrphan(id string) (*Macro, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	buf, err := os.ReadFile(filepath.Join(s.dir, sanitizeID(id)) + ".orphan.json")
+	if err != nil {
+		return nil, err
+	}
+	var m Macro
+	if err := json.Unmarshal(buf, &m); err != nil {
+		return nil, fmt.Errorf("orphan %q: %w", id, err)
+	}
+	return &m, nil
+}
+
+// PromoteOrphan moves a parked draft into the regular store (still unapproved).
+// It overwrites an existing draft with the same id only if that draft is not
+// approved; an approved macro is never replaced implicitly.
+func (s *Store) PromoteOrphan(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	buf, err := os.ReadFile(filepath.Join(s.dir, sanitizeID(id)) + ".orphan.json")
+	if err != nil {
+		return err
+	}
+	var m Macro
+	if err := json.Unmarshal(buf, &m); err != nil {
+		return fmt.Errorf("orphan %q: %w", id, err)
+	}
+	if err := m.Validate(); err != nil {
+		return err
+	}
+	if existing, err := s.getLocked(id); err == nil && existing.Approved != nil {
+		return fmt.Errorf("macro %q is approved; revoke it before promoting an orphan over it", id)
+	}
+	if err := s.writeLocked(&m); err != nil {
+		return err
+	}
+	return os.Remove(filepath.Join(s.dir, sanitizeID(id)) + ".orphan.json")
+}
+
+// DiscardOrphan deletes a parked draft.
+func (s *Store) DiscardOrphan(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return os.Remove(filepath.Join(s.dir, sanitizeID(id)) + ".orphan.json")
+}
+
 // Approve stamps a macro as human-approved and persists it.
 func (s *Store) Approve(id, by string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	m, err := s.Get(id)
+	m, err := s.getLocked(id)
 	if err != nil {
 		return err
 	}
@@ -245,15 +369,33 @@ func (s *Store) Approve(id, by string) error {
 		return err
 	}
 	m.Approved = &Approval{By: by, At: time.Now().UTC()}
+	return s.writeLocked(m)
+}
+
+// getLocked loads a macro; the caller holds s.mu.
+func (s *Store) getLocked(id string) (*Macro, error) {
+	buf, err := os.ReadFile(s.path(id))
+	if err != nil {
+		return nil, err
+	}
+	var m Macro
+	if err := json.Unmarshal(buf, &m); err != nil {
+		return nil, fmt.Errorf("macro %q: %w", id, err)
+	}
+	return &m, nil
+}
+
+// writeLocked persists a macro atomically; the caller holds s.mu.
+func (s *Store) writeLocked(m *Macro) error {
 	buf, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
-	tmp := s.path(id) + ".tmp"
+	tmp := s.path(m.ID) + ".tmp"
 	if err := os.WriteFile(tmp, buf, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, s.path(id))
+	return os.Rename(tmp, s.path(m.ID))
 }
 
 // HashProfile summarizes a browser profile directory (userdata dir contents)

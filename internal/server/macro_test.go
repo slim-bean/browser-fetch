@@ -8,7 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -42,11 +42,12 @@ func TestRequireMacrosDisabled(t *testing.T) {
 func TestMacroStoreLifecycle(t *testing.T) {
 	s, ms := testServerWithMacros(t)
 
-	// Approve an unknown macro -> 400.
+	// Approve via the admin band: unknown macro -> 400.
+	admin := NewAdmin(ms.store, "admin-secret")
 	w := httptest.NewRecorder()
-	s.handleMacroApprove(w, mustJSON(t, "POST", "/macro/approve", map[string]string{"macro_id": "nope"}))
-	if w.Code != 400 {
-		t.Fatalf("approve unknown: %d %s", w.Code, w.Body.String())
+	admin.Handler().ServeHTTP(w, mustJSON(t, "POST", "/action", nil))
+	if w.Code != 401 {
+		t.Fatalf("admin without token must 401, got %d", w.Code)
 	}
 
 	// Store a draft with one step through the real Store, then list and approve.
@@ -69,15 +70,15 @@ func TestMacroStoreLifecycle(t *testing.T) {
 		t.Fatalf("replay unapproved: %d %s", w.Code, w.Body.String())
 	}
 
-	// Approve, then replay fails on missing session machinery (500/400, not
-	// 403) — approval gate is in front.
+	// Approve through the admin band, then replay fails on missing session
+	// machinery (500/400, not 403) — approval gate is in front.
 	w = httptest.NewRecorder()
-	s.handleMacroApprove(w, mustJSON(t, "POST", "/macro/approve", map[string]string{"macro_id": "test-macro", "by": "ed"}))
-	if w.Code != 200 {
-		t.Fatalf("approve: %d %s", w.Code, w.Body.String())
+	admin.Handler().ServeHTTP(w, adminForm("approve", "test-macro", "admin-secret"))
+	if w.Code != 303 {
+		t.Fatalf("admin approve: %d %s", w.Code, w.Body.String())
 	}
 	stored, err := ms.store.Get("test-macro")
-	if err != nil || stored.Approved == nil || stored.Approved.By != "ed" {
+	if err != nil || stored.Approved == nil || !strings.Contains(stored.Approved.By, "admin band") {
 		t.Fatalf("approval not persisted: %+v %v", stored, err)
 	}
 
@@ -148,6 +149,18 @@ func mustJSON(t *testing.T, method, path string, body any) *http.Request {
 		t.Fatal(err)
 	}
 	return httptest.NewRequest(method, path, bytes.NewReader(b))
+}
+
+// adminForm builds a POST /action request as the admin UI's HTML forms do:
+// token + op + id (+ optional index) as form fields.
+func adminForm(op, id, token string, index ...string) *http.Request {
+	form := url.Values{"t": {token}, "op": {op}, "id": {id}}
+	if len(index) > 0 {
+		form.Set("index", index[0])
+	}
+	req := httptest.NewRequest("POST", "/action", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req
 }
 
 // recordingTab is a Tab whose StartRecording returns a channel the test
