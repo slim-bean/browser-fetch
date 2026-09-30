@@ -237,3 +237,34 @@ func TestDispatchAutofillWaitsForFill(t *testing.T) {
 		t.Fatalf("already-filled field should pass immediately: %v", err)
 	}
 }
+
+func TestDispatchAutofillToleratesTransientProbeErrors(t *testing.T) {
+	tab := &fakeTab{ctx: context.Background()}
+	m := New(nil, func(ctx context.Context) (Tab, func(), error) {
+		return tab, func() {}, nil
+	}, Options{MaxSessions: 2, ActionTimeout: 10 * time.Second, AssertTTL: 30 * time.Second})
+	if _, err := m.Open(context.Background(), "example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Polls that error while the page settles (navigation, CDP hiccup) must be
+	// retried, not fail the step — matching the observed production failure
+	// where Chrome-PM autofill arrives seconds after the fill probe errors.
+	calls := 0
+	prev := fieldFilled
+	fieldFilled = func(ctx context.Context, tab Tab, selector string) (bool, error) {
+		calls++
+		if calls < 4 {
+			return false, errors.New("context canceled")
+		}
+		return true, nil
+	}
+	t.Cleanup(func() { fieldFilled = prev })
+
+	if err := dispatchAutofill(context.Background(), tab, AutofillAction{Selector: "#pw", TimeoutMS: 3000}); err != nil {
+		t.Fatalf("transient probe errors must be retried until the fill arrives: %v", err)
+	}
+	if calls < 4 {
+		t.Fatalf("expected at least 4 polls, got %d", calls)
+	}
+}

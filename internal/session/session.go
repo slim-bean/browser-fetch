@@ -220,7 +220,10 @@ func (s *Session) close() error {
 	tab, release := s.tab, s.release
 	s.mu.Unlock()
 
-	// Park the tab like the pool does between jobs.
+	// Park the tab like the pool does between jobs. Whether the tab is healthy
+	// is decided in the release func (SessionTabCtx.Err() == nil): a tab that
+	// died mid-session (e.g. a human closed it in the VNC) cannot be parked
+	// usefully, and the release path retires it instead of re-pooling a corpse.
 	parkCtx, cancel := context.WithTimeout(tab.Ctx(), 5*time.Second)
 	defer cancel()
 	_ = runOn(parkCtx, chromedp.Navigate("about:blank"))
@@ -429,7 +432,7 @@ func (WaitAction) Kind() string { return "wait" }
 type AutofillAction struct {
 	// Selector targets the filled element (CSS, or XPath starting with //).
 	Selector string `json:"selector"`
-	// TimeoutMS bounds the wait; 0 uses the default (5s).
+	// TimeoutMS bounds the wait; 0 uses the default (15s).
 	TimeoutMS int64 `json:"timeout_ms,omitempty"`
 }
 
@@ -784,17 +787,24 @@ func dispatchAutofill(ctx context.Context, tab Tab, a AutofillAction) error {
 	}
 	timeout := a.TimeoutMS
 	if timeout <= 0 {
-		timeout = 5000
+		// Chrome's password manager fills in bursts (often two rounds) and can
+		// lag the navigation by several seconds; a 5s window aborts replays that
+		// are actually succeeding. 15s spans the observed fill window.
+		timeout = 15000
 	}
 	deadline := time.Now().Add(time.Duration(timeout) * time.Millisecond)
+	var lastErr error
 	for {
 		filled, err := fieldFilled(ctx, tab, a.Selector)
 		if err == nil && filled {
 			return nil
 		}
+		if err != nil {
+			lastErr = err
+		}
 		if time.Now().After(deadline) {
-			if err != nil {
-				return fmt.Errorf("autofill check failed for %q: %w", a.Selector, err)
+			if lastErr != nil {
+				return fmt.Errorf("autofill check failed for %q: %w", a.Selector, lastErr)
 			}
 			return fmt.Errorf("field %q was never filled (autofill did not arrive in %dms)", a.Selector, timeout)
 		}
