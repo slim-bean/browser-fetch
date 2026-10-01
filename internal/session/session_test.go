@@ -237,3 +237,107 @@ func TestDispatchAutofillWaitsForFill(t *testing.T) {
 		t.Fatalf("already-filled field should pass immediately: %v", err)
 	}
 }
+
+func TestDispatchAutofillToleratesTransientProbeErrors(t *testing.T) {
+	tab := &fakeTab{ctx: context.Background()}
+	m := New(nil, func(ctx context.Context) (Tab, func(), error) {
+		return tab, func() {}, nil
+	}, Options{MaxSessions: 2, ActionTimeout: 10 * time.Second, AssertTTL: 30 * time.Second})
+	if _, err := m.Open(context.Background(), "example.com"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Polls that error while the page settles (navigation, CDP hiccup) must be
+	// retried, not fail the step — matching the observed production failure
+	// where Chrome-PM autofill arrives seconds after the fill probe errors.
+	calls := 0
+	prev := fieldFilled
+	fieldFilled = func(ctx context.Context, tab Tab, selector string) (bool, error) {
+		calls++
+		if calls < 4 {
+			return false, errors.New("context canceled")
+		}
+		return true, nil
+	}
+	t.Cleanup(func() { fieldFilled = prev })
+
+	if err := dispatchAutofill(context.Background(), tab, AutofillAction{Selector: "#pw", TimeoutMS: 3000}); err != nil {
+		t.Fatalf("transient probe errors must be retried until the fill arrives: %v", err)
+	}
+	if calls < 4 {
+		t.Fatalf("expected at least 4 polls, got %d", calls)
+	}
+}
+
+// TestDispatchFieldsRoundTrip covers the fields introspection action:
+// presence/filled/length per selector, value material never returned.
+func TestDispatchFieldsRoundTrip(t *testing.T) {
+	tab := &fakeTab{ctx: context.Background()}
+	if _, err := dispatchFields(context.Background(), tab, FieldsAction{}); err == nil {
+		t.Fatal("empty selectors must be rejected")
+	}
+	if _, err := dispatchFields(context.Background(), tab, FieldsAction{Selectors: make([]string, 21)}); err == nil {
+		t.Fatal(">20 selectors must be rejected")
+	}
+
+	var gotScript string
+	prev := runEvaluate
+	runEvaluate = func(ctx context.Context, tab Tab, script string, res any) error {
+		gotScript = script
+		// Simulate one missing and one filled-and-typed field.
+		sl, ok := res.(*[]struct {
+			Sel string `json:"sel"`
+			R   *struct {
+				Filled bool   `json:"filled"`
+				Len    int    `json:"len"`
+				T      string `json:"t"`
+			} `json:"r"`
+		})
+		if !ok {
+			t.Fatalf("dispatchFields must pass a pointer to its result slice, got %T", res)
+		}
+		*sl = []struct {
+			Sel string `json:"sel"`
+			R   *struct {
+				Filled bool   `json:"filled"`
+				Len    int    `json:"len"`
+				T      string `json:"t"`
+			} `json:"r"`
+		}{
+			{Sel: "#gone"},
+			{Sel: "#pw", R: &struct {
+				Filled bool   `json:"filled"`
+				Len    int    `json:"len"`
+				T      string `json:"t"`
+			}{Filled: true, Len: 12, T: "password"}},
+		}
+		return nil
+	}
+	t.Cleanup(func() { runEvaluate = prev })
+
+	out, err := dispatchFields(context.Background(), tab, FieldsAction{Selectors: []string{"#gone", "#pw"}})
+	if err != nil {
+		t.Fatalf("fields: %v", err)
+	}
+	states, ok := out.([]FieldState)
+	if !ok {
+		t.Fatalf("fields result is %T", out)
+	}
+	if len(states) != 2 {
+		t.Fatalf("want 2 states, got %d", len(states))
+	}
+	if states[0].Found || states[0].Filled {
+		t.Fatalf("missing element must be not-found: %+v", states[0])
+	}
+	if !states[1].Found || !states[1].Filled || states[1].ValueLength != 12 || states[1].InputType != "password" {
+		t.Fatalf("unexpected state: %+v", states[1])
+	}
+	// Selectors must appear in the script as quoted literals only.
+	if !strings.Contains(gotScript, `"#gone"`) || !strings.Contains(gotScript, `"#pw"`) {
+		t.Fatalf("probe script must quote selectors as literals: %s", gotScript)
+	}
+	// The probe returns only filled/len/type — no value key anywhere.
+	if strings.Contains(gotScript, `el.value`) && !strings.Contains(gotScript, "String(el.value)") {
+		t.Fatalf("probe must not return raw values: %s", gotScript)
+	}
+}

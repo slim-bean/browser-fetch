@@ -127,6 +127,7 @@ accessible to a restricted finance driver.
 | `content` | — | current `{url,title,html}` snapshot |
 | `download` | `click_selector`, `filename_regexp`, `timeout_ms`, `max_bytes` | captures the file via CDP, returns base64 + `sha256` |
 | `assert` | `expect` (`url`,`title`,`landmark`,`landmarks`), `pattern`, `landmarks`, `min_match` | layered screen identity; only exact `url`/`title` matches enable credential typing |
+| `fields` | `selectors` | introspect form fields: per selector `{found, filled, value_length, input_type}` — never the value itself; the trusted way to check whether autofill arrived |
 
 Every action is recorded in the session's evidence log with outcome and
 duration; password values are recorded as length only, never text.

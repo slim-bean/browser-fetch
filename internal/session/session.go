@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/cdp"
 	"github.com/chromedp/chromedp"
 )
 
@@ -220,7 +221,10 @@ func (s *Session) close() error {
 	tab, release := s.tab, s.release
 	s.mu.Unlock()
 
-	// Park the tab like the pool does between jobs.
+	// Park the tab like the pool does between jobs. Whether the tab is healthy
+	// is decided in the release func (SessionTabCtx.Err() == nil): a tab that
+	// died mid-session (e.g. a human closed it in the VNC) cannot be parked
+	// usefully, and the release path retires it instead of re-pooling a corpse.
 	parkCtx, cancel := context.WithTimeout(tab.Ctx(), 5*time.Second)
 	defer cancel()
 	_ = runOn(parkCtx, chromedp.Navigate("about:blank"))
@@ -429,7 +433,7 @@ func (WaitAction) Kind() string { return "wait" }
 type AutofillAction struct {
 	// Selector targets the filled element (CSS, or XPath starting with //).
 	Selector string `json:"selector"`
-	// TimeoutMS bounds the wait; 0 uses the default (5s).
+	// TimeoutMS bounds the wait; 0 uses the default (15s).
 	TimeoutMS int64 `json:"timeout_ms,omitempty"`
 }
 
@@ -447,6 +451,31 @@ func (ScreenshotAction) Kind() string { return "screenshot" }
 type ContentAction struct{}
 
 func (ContentAction) Kind() string { return "content" }
+
+// FieldsAction introspects form fields: for each selector it reports whether
+// the element exists, whether it carries a value, and the value's length —
+// never the value itself. Read-only, agent-safe (answers "did autofill
+// arrive?" without trusting screenshots or exposing secret material).
+type FieldsAction struct {
+	// Selectors are the CSS selectors (or XPath, "//" prefix) to probe.
+	Selectors []string `json:"selectors"`
+}
+
+func (FieldsAction) Kind() string { return "fields" }
+
+// FieldState is one probed field's answer.
+type FieldState struct {
+	Selector string `json:"selector"`
+	// Found is false when nothing matched the selector.
+	Found bool `json:"found"`
+	// Filled is true when the element carries a non-empty value.
+	Filled bool `json:"filled"`
+	// ValueLength is len(value); never the value.
+	ValueLength int `json:"value_length"`
+	// InputType is the element's type attribute when present ("email",
+	// "password", ...). Site metadata, not secret material.
+	InputType string `json:"input_type,omitempty"`
+}
 
 // AssertKind enumerates layered screen identity checks.
 type AssertKind string
@@ -553,6 +582,8 @@ func (m *Manager) dispatch(ctx context.Context, s *Session, tab Tab, a Action) (
 		return dispatchScreenshot(ctx, v)
 	case ContentAction:
 		return tab.Read(ctx)
+	case FieldsAction:
+		return dispatchFields(ctx, tab, v)
 	case DownloadAction:
 		return dispatchDownload(ctx, tab, v)
 	case AssertAction:
@@ -775,26 +806,44 @@ func dispatchAssert(ctx context.Context, tab Tab, a AssertAction) (any, error) {
 	}
 }
 
-// dispatchAutofill polls the field's .value via Runtime.evaluate until it is
-// non-empty or the budget expires. The value itself is never returned or
-// logged — only presence/absence — so no secret material reaches evidence.
+// dispatchAutofill wakes Chrome's password manager with a trusted user
+// gesture (a CDP mouse click into the target field — the browser requires a
+// gesture before it will fill credentials), then polls the field's .value
+// via Runtime.evaluate until it is non-empty or the budget expires. The
+// value itself is never returned or logged — only presence/absence and
+// length — so no secret material reaches evidence.
 func dispatchAutofill(ctx context.Context, tab Tab, a AutofillAction) error {
 	if a.Selector == "" {
 		return errors.New("autofill needs selector")
 	}
+	// Fire the wake gesture before the first probe. A fill that already
+	// happened is unaffected; a gesture that arrives late still beats the
+	// wait budget. Failures here are soft: a field inside a closed modal or
+	// an XPath-targeted element may not be clickable, and the fill may
+	// already be in place — the poll below is the source of truth.
+	if err := dispatchFieldGesture(ctx, tab, a.Selector); err != nil {
+		_ = err // soft: poll decides the outcome
+	}
 	timeout := a.TimeoutMS
 	if timeout <= 0 {
-		timeout = 5000
+		// Chrome's password manager fills in bursts (often two rounds) and can
+		// lag the navigation by several seconds; a 5s window aborts replays that
+		// are actually succeeding. 15s spans the observed fill window.
+		timeout = 15000
 	}
 	deadline := time.Now().Add(time.Duration(timeout) * time.Millisecond)
+	var lastErr error
 	for {
 		filled, err := fieldFilled(ctx, tab, a.Selector)
 		if err == nil && filled {
 			return nil
 		}
+		if err != nil {
+			lastErr = err
+		}
 		if time.Now().After(deadline) {
-			if err != nil {
-				return fmt.Errorf("autofill check failed for %q: %w", a.Selector, err)
+			if lastErr != nil {
+				return fmt.Errorf("autofill check failed for %q: %w", a.Selector, lastErr)
 			}
 			return fmt.Errorf("field %q was never filled (autofill did not arrive in %dms)", a.Selector, timeout)
 		}
@@ -802,6 +851,80 @@ func dispatchAutofill(ctx context.Context, tab Tab, a AutofillAction) error {
 			return err
 		}
 	}
+}
+
+// dispatchFieldGesture synthesizes a trusted user gesture on the field so
+// Chrome's password manager treats the page as user-activated and fills
+// saved credentials. Chrome deliberately refuses to autofill passwords on
+// programmatic page loads (no gesture, no fill) — the canonical behavior
+// everyone driving Chrome over CDP hits. A mouse press+release at the
+// element's center is the same signal a human click produces. Package var so
+// tests can stub the browser.
+var dispatchFieldGesture = func(ctx context.Context, tab Tab, selector string) error {
+	gctx, cancel := context.WithTimeout(tab.Ctx(), 5*time.Second)
+	defer cancel()
+	// Resolve the element, scroll it into view, then dispatch a trusted
+	// left click at the box center. Mirrors chromedp.MouseClickNode but
+	// driven by a selector (CSS or XPath via BySearch).
+	var nodes []*cdp.Node
+	if err := runOn(gctx, chromedp.Nodes(selector, &nodes, chromedp.NodeVisible, bySearchIfXPath(selector))); err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
+		return errors.New("gesture target not found: " + selector)
+	}
+	return runOn(gctx, chromedp.MouseClickNode(nodes[0]))
+}
+
+// runEvaluate evaluates one gateway-authored script on the tab. Package var
+// so tests can stub the browser (mirrors fieldFilled/runOn).
+var runEvaluate = func(ctx context.Context, tab Tab, script string, res any) error {
+	return runOn(ctx, chromedp.Evaluate(script, res))
+}
+
+// dispatchFields probes each selector and reports presence/fill-state.
+// The probe script is gateway-authored and fixed (no caller JS): it returns
+// only booleans and lengths, never values.
+func dispatchFields(ctx context.Context, tab Tab, a FieldsAction) (any, error) {
+	if len(a.Selectors) == 0 {
+		return nil, errors.New("fields needs selectors")
+	}
+	if len(a.Selectors) > 20 {
+		return nil, errors.New("fields takes at most 20 selectors")
+	}
+	// Build one evaluate that probes every selector in one round-trip.
+	var probes []string
+	for _, sel := range a.Selectors {
+		probes = append(probes, fmt.Sprintf(
+			`{sel: %s, r: (() => { const el = document.querySelector(%s); if (!el) return null; const v = ("value" in el) ? String(el.value) : (el.textContent || ""); return {filled: v !== "", len: v.length, t: el.getAttribute("type") || ""}; })()}`,
+			jsQuote(sel), jsQuote(sel)))
+	}
+	var res []struct {
+		Sel string `json:"sel"`
+		R   *struct {
+			Filled bool   `json:"filled"`
+			Len    int    `json:"len"`
+			T      string `json:"t"`
+		} `json:"r"`
+	}
+	script := `(() => { return [` + strings.Join(probes, ",") + `]; })()`
+	ectx, cancel := context.WithTimeout(tab.Ctx(), 5*time.Second)
+	defer cancel()
+	if err := runEvaluate(ectx, tab, script, &res); err != nil {
+		return nil, err
+	}
+	out := make([]FieldState, 0, len(a.Selectors))
+	for _, p := range res {
+		fs := FieldState{Selector: p.Sel}
+		if p.R != nil {
+			fs.Found = true
+			fs.Filled = p.R.Filled
+			fs.ValueLength = p.R.Len
+			fs.InputType = p.R.T
+		}
+		out = append(out, fs)
+	}
+	return out, nil
 }
 
 // fieldFilled reports whether the element currently carries a value. A package

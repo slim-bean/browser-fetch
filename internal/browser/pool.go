@@ -77,22 +77,28 @@ func (p *pool) stat() PoolStat {
 
 // acquire returns a ready tab, creating one if the pool is not yet full.
 func (p *pool) acquire(ctx context.Context) (*page, error) {
-	// Prefer an idle tab.
-	select {
-	case pg := <-p.free:
-		p.markBusy(+1)
-		return pg, nil
-	default:
+	// A tab a human closed in the VNC is dead: its context is canceled and
+	// every CDP command on it fails. Detect that here instead of leasing
+	// corpses (the gateway does not subscribe to target-destroyed events, so
+	// pool state alone cannot tell a live idle tab from a dead one).
+	dead := func(pg *page) bool {
+		if pg.ctx.Err() == nil {
+			return false
+		}
+		p.m.log.Warn("retiring dead pooled tab", "page", pg.id, "err", pg.ctx.Err())
+		p.retire(pg)
+		return true
 	}
-
-	p.mu.Lock()
-	canCreate := p.created < p.size
-	if canCreate {
-		p.created++
-	}
-	p.mu.Unlock()
-
-	if canCreate {
+	tryCreate := func() (*page, error) {
+		p.mu.Lock()
+		canCreate := p.created < p.size
+		if canCreate {
+			p.created++
+		}
+		p.mu.Unlock()
+		if !canCreate {
+			return nil, nil
+		}
 		pg, err := p.newPage()
 		if err != nil {
 			p.mu.Lock()
@@ -104,12 +110,37 @@ func (p *pool) acquire(ctx context.Context) (*page, error) {
 		return pg, nil
 	}
 
-	select {
-	case pg := <-p.free:
-		p.markBusy(+1)
-		return pg, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	// Fast path: a live idle tab.
+	for {
+		select {
+		case pg := <-p.free:
+			if dead(pg) {
+				continue
+			}
+			p.markBusy(+1)
+			return pg, nil
+		default:
+		}
+		// No idle tab (or all idle ones were dead): create if capacity allows.
+		pg, err := tryCreate()
+		if err != nil {
+			return nil, err
+		}
+		if pg != nil {
+			return pg, nil
+		}
+		// Pool at capacity with no live idle tab: wait for a release, skipping
+		// corpses as they come back.
+		select {
+		case pg := <-p.free:
+			if dead(pg) {
+				continue // freed capacity; loop retries creation
+			}
+			p.markBusy(+1)
+			return pg, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
 	}
 }
 
@@ -136,7 +167,9 @@ func (p *pool) park(pg *page) {
 }
 
 func (p *pool) retire(pg *page) {
-	pg.cancel()
+	if pg.cancel != nil {
+		pg.cancel()
+	}
 	p.mu.Lock()
 	p.created--
 	p.retired++
@@ -147,7 +180,10 @@ func (p *pool) retire(pg *page) {
 		}
 	}
 	p.mu.Unlock()
-	p.m.log.Warn("retired unhealthy tab", "page", pg.id, "uses", pg.uses)
+	pg.mu.Lock()
+	uses := pg.uses
+	pg.mu.Unlock()
+	p.m.log.Warn("retired unhealthy tab", "page", pg.id, "uses", uses)
 }
 
 func (p *pool) markBusy(delta int) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 )
@@ -84,7 +85,14 @@ const CaptureScript = `(() => {
   document.addEventListener('click', (ev) => {
     const el = ev.target && ev.target.closest ? ev.target.closest('button, a, [role=button], input[type=submit], input[type=checkbox], select, li, tr') : null;
     if (!el) return;
-    send({ ev: 'click', element: describe(el), url: url(), at: at() });
+    // Site teardown during navigation re-fires or re-targets clicks whose
+    // element chain is mid-detachment; describe() on such a node yields no
+    // candidates. These naked clicks are transition noise, never a real
+    // second human action (a real click always resolves), so drop them here
+    // rather than recording steps replay can never execute.
+    const d = describe(el);
+    if (!d.candidates || d.candidates.length === 0) return;
+    send({ ev: 'click', element: d, url: url(), at: at() });
   }, true);
 
   // Change events (text inputs, selects). NEVER send the value for password
@@ -136,6 +144,25 @@ const CaptureScript = `(() => {
   document.addEventListener('submit', (ev) => {
     send({ ev: 'submit', url: url(), at: at() });
   }, true);
+
+  // Navigations: without them a recording cannot be replayed from a fresh
+  // session (the replay tab starts on about:blank). Emit a nav event on every
+  // new-document load, whether the human typed a URL or the site redirected.
+  // Deduplicate: this script re-installs per document, so only the first run
+  // in each document reports the initial load.
+  // Top-frame only: this script installs in every frame, and sites (e.g.
+  // tirerack's keepSessionAlive.jsp) load keepalive/service frames that would
+  // otherwise be recorded as top-level navigations — replay would then
+  // re-navigate the whole tab to the frame URL.
+  if (window.top !== window.self) {
+    // Frame context: no nav events, but interactions inside frames still
+    // record (the binding and describe() work per-frame).
+  } else if (!window.__bfNavReported) {
+    window.__bfNavReported = true;
+    // Defer slightly so location.href reflects the real document, not an
+    // early redirect hop.
+    setTimeout(() => send({ ev: 'nav', url: url(), at: at() }), 150);
+  }
 })();`
 
 // BindingName is the CDP binding added via Runtime.addBinding; the page
@@ -177,6 +204,31 @@ func (r *Recorder) AddEvent(payload []byte) error {
 		step = Step{Action: json.RawMessage(`{"kind":"type","field":"` + e.Field + `"}`), Recorded: rec}
 	case "submit":
 		step = Step{Action: json.RawMessage(`{"kind":"click"}`), Recorded: rec}
+	case "nav":
+		if e.URL == "" {
+			return fmt.Errorf("nav event without url")
+		}
+		// about:blank/data loads are pre-recording state, not part of the flow.
+		if strings.HasPrefix(e.URL, "about:") || strings.HasPrefix(e.URL, "data:") {
+			return nil
+		}
+		// Collapse redirect chains: keep only the final URL when navigations
+		// arrive back-to-back with no interaction between them.
+		r.mu.Lock()
+		if n := len(r.steps); n > 0 {
+			var prev struct {
+				Kind string `json:"kind"`
+				URL  string `json:"url"`
+			}
+			_ = json.Unmarshal(r.steps[n-1].Action, &prev)
+			if prev.Kind == "navigate" {
+				r.steps[n-1] = Step{Action: json.RawMessage(`{"kind":"navigate","url":` + jsString(e.URL) + `}`), Recorded: rec}
+				r.mu.Unlock()
+				return nil
+			}
+		}
+		r.mu.Unlock()
+		step = Step{Action: json.RawMessage(`{"kind":"navigate","url":` + jsString(e.URL) + `}`), Recorded: rec}
 	case "autofill":
 		// A programmatic fill (Chrome password manager et al). Recorded so
 		// replay can assert the field is actually filled — if the fill ever
@@ -226,5 +278,11 @@ func selectorJSON(e *Element) string {
 		return `""`
 	}
 	c, _ := json.Marshal(e.Candidates[0])
+	return string(c)
+}
+
+// jsString renders s as a JSON string literal.
+func jsString(s string) string {
+	c, _ := json.Marshal(s)
 	return string(c)
 }

@@ -32,7 +32,7 @@ func (m *Manager) Acquire(ctx context.Context) (*SessionTab, func(), error) {
 		return nil, nil, err
 	}
 	st := &SessionTab{m: m, p: p}
-	release := func() { m.pool.release(p, true) }
+	release := func() { m.pool.release(p, p.ctx.Err() == nil) }
 	return st, release, nil
 }
 

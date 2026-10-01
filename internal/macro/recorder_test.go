@@ -146,3 +146,73 @@ func TestAddEventKeypressBeforeAutofillIsNotTyping(t *testing.T) {
 		t.Fatalf("keyless fill must stay autofill, got %s", steps[0].Action)
 	}
 }
+
+func TestAddEventNav(t *testing.T) {
+	r := NewRecorder("id", "site.com")
+	if err := r.AddEvent([]byte(`{"ev":"nav","url":"https://site.com/login","at":"2026-01-01T00:00:00Z"}`)); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	steps := r.Steps()
+	if len(steps) != 1 {
+		t.Fatalf("want 1 step, got %d", len(steps))
+	}
+	var a struct {
+		Kind string `json:"kind"`
+		URL  string `json:"url"`
+	}
+	if err := json.Unmarshal(steps[0].Action, &a); err != nil {
+		t.Fatal(err)
+	}
+	if a.Kind != "navigate" || a.URL != "https://site.com/login" {
+		t.Fatalf("nav step: %s", steps[0].Action)
+	}
+}
+
+func TestAddEventNavSkipsAboutBlank(t *testing.T) {
+	r := NewRecorder("id", "site.com")
+	for _, u := range []string{"about:blank", "data:text/html,x"} {
+		if err := r.AddEvent([]byte(`{"ev":"nav","url":"` + u + `"}`)); err != nil {
+			t.Fatalf("add %s: %v", u, err)
+		}
+	}
+	if steps := r.Steps(); len(steps) != 0 {
+		t.Fatalf("about:/data: navs must be skipped, got %d steps", len(steps))
+	}
+}
+
+func TestAddEventNavCollapsesRedirectChain(t *testing.T) {
+	r := NewRecorder("id", "site.com")
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(r.AddEvent([]byte(`{"ev":"nav","url":"https://site.com/a"}`)))
+	must(r.AddEvent([]byte(`{"ev":"nav","url":"https://site.com/b"}`))) // redirect
+	must(r.AddEvent([]byte(`{"ev":"click","element":{"candidates":["#btn"],"role":"button"}}`)))
+	must(r.AddEvent([]byte(`{"ev":"nav","url":"https://site.com/after-click"}`)))
+	steps := r.Steps()
+	if len(steps) != 3 {
+		t.Fatalf("want 3 steps (nav, click, nav), got %d", len(steps))
+	}
+	var a struct {
+		Kind string `json:"kind"`
+		URL  string `json:"url"`
+	}
+	if err := json.Unmarshal(steps[0].Action, &a); err != nil {
+		t.Fatal(err)
+	}
+	if a.URL != "https://site.com/b" {
+		t.Fatalf("redirect chain must keep the final URL, got %s", a.URL)
+	}
+}
+
+func TestCaptureScriptEmitsNav(t *testing.T) {
+	if !contains(CaptureScript, `ev: 'nav'`) {
+		t.Fatal("capture script must report navigations; recordings without nav steps cannot replay from a fresh session")
+	}
+	if !contains(CaptureScript, "__bfNavReported") {
+		t.Fatal("capture script must dedupe per-document nav reports")
+	}
+}
