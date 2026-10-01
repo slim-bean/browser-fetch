@@ -150,7 +150,14 @@ const CaptureScript = `(() => {
   // new-document load, whether the human typed a URL or the site redirected.
   // Deduplicate: this script re-installs per document, so only the first run
   // in each document reports the initial load.
-  if (!window.__bfNavReported) {
+  // Top-frame only: this script installs in every frame, and sites (e.g.
+  // tirerack's keepSessionAlive.jsp) load keepalive/service frames that would
+  // otherwise be recorded as top-level navigations — replay would then
+  // re-navigate the whole tab to the frame URL.
+  if (window.top !== window.self) {
+    // Frame context: no nav events, but interactions inside frames still
+    // record (the binding and describe() work per-frame).
+  } else if (!window.__bfNavReported) {
     window.__bfNavReported = true;
     // Defer slightly so location.href reflects the real document, not an
     // early redirect hop.

@@ -319,12 +319,16 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sess, err := s.openReplaySession(r, req, m)
+	sess, ownedSession, err := s.openReplaySession(r, req, m)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error(), Code: "session_unavailable"})
 		return
 	}
-	defer func() { _ = s.sessions.Close(sess.ID) }()
+	// Close only sessions this handler leased. A caller-provided session
+	// (pre-navigated by the operator or mid-flow) must survive the replay.
+	if ownedSession {
+		defer func() { _ = s.sessions.Close(sess.ID) }()
+	}
 
 	re := &macro.Replayer{
 		Secrets:            s.secrets,
@@ -375,15 +379,17 @@ func evidenceView(sess *session.Session) []session.ActionRecord {
 	return sess.Records()
 }
 
-func (s *Server) openReplaySession(r *http.Request, req replayRequest, m *macro.Macro) (*session.Session, error) {
+func (s *Server) openReplaySession(r *http.Request, req replayRequest, m *macro.Macro) (*session.Session, bool, error) {
 	if req.SessionID != "" {
-		return s.sessions.Get(req.SessionID)
+		sess, err := s.sessions.Get(req.SessionID)
+		return sess, false, err
 	}
 	host := req.Site
 	if host == "" {
 		host = m.Site
 	}
-	return s.sessions.Open(r.Context(), host)
+	sess, err := s.sessions.Open(r.Context(), host)
+	return sess, true, err
 }
 
 // ---- pause/resume ------------------------------------------------------------------

@@ -228,3 +228,49 @@ func TestRecordCaptureOutlivesStartRequest(t *testing.T) {
 		t.Fatalf("draft must capture the post-request click, got %d steps", len(stored.Steps))
 	}
 }
+
+// TestOpenReplaySessionOwnership pins the contract fix: a caller-provided
+// session (pre-navigated by the operator) must come back owned=false so the
+// replay handler does not close it; a handler-leased session is owned=true.
+func TestOpenReplaySessionOwnership(t *testing.T) {
+	tabOpen := false
+	mgr := session.New(nil, func(ctx context.Context) (session.Tab, func(), error) {
+		tabOpen = true
+		return &fakeReplayTab{}, func() {}, nil
+	}, session.Options{MaxSessions: 2, MaxIdle: time.Minute, ActionTimeout: 5 * time.Second, AssertTTL: 30 * time.Second, MaxLog: 10})
+	s := &Server{sessions: mgr}
+	m := &macro.Macro{ID: "m", Site: "example.com"}
+
+	req := &replayRequest{}
+	sess, owned, err := s.openReplaySession(httptest.NewRequest("POST", "/macro/replay", nil), *req, m)
+	if err != nil {
+		t.Fatalf("lease: %v", err)
+	}
+	if !owned {
+		t.Fatal("self-leased session must be owned")
+	}
+	_ = sess
+
+	caller := &replayRequest{SessionID: "caller-session"}
+	if _, err := mgr.Open(context.Background(), "example.com"); err != nil {
+		t.Fatal(err)
+	}
+	// Get of a session the handler did not create: exercise the not-found path
+	// shape too.
+	_, owned, err = s.openReplaySession(httptest.NewRequest("POST", "/macro/replay", nil), *caller, m)
+	if err == nil {
+		if owned {
+			t.Fatal("caller-provided session must not be marked owned")
+		}
+	} else if !strings.Contains(err.Error(), "not found") && !strings.Contains(err.Error(), "no such session") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_ = tabOpen
+}
+
+type fakeReplayTab struct{}
+
+func (fakeReplayTab) Ctx() context.Context { return context.Background() }
+func (fakeReplayTab) Read(ctx context.Context) (session.Snapshot, error) {
+	return session.Snapshot{URL: "https://example.com/", Title: "t", HTML: "<html/>"}, nil
+}

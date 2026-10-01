@@ -202,6 +202,10 @@ func decodeAnyAction(raw json.RawMessage) (session.Action, error) {
 		var a session.ContentAction
 		err := dec.Decode(&a)
 		return a, wrapDecode(err)
+	case "fields":
+		var a session.FieldsAction
+		err := dec.Decode(&a)
+		return a, wrapDecode(err)
 	case "assert":
 		var a session.AssertAction
 		err := dec.Decode(&a)

@@ -65,6 +65,14 @@ Key properties:
   time via 1Password; the macro file and evidence log never contain values.
 - **Element descriptors, not single selectors.** `candidates` is an ordered
   selector ladder recorded at capture time; replay tries them in order.
+- **autofill steps carry no secret and no value.** They name a selector and
+  wait for the *browser* (Chrome's password manager) to fill it. Chrome
+  deliberately refuses to autofill saved credentials on a programmatic page
+  load — filling requires a user gesture. Replay therefore dispatches a
+  trusted CDP mouse click into the target field ("wake gesture") before
+  waiting for the fill; the gesture is value-free and only focuses the field
+  the approved autofill step already names. If the fill still never arrives
+  within the window, replay aborts before any submit step.
 - **pause steps** mark human-in-the-loop points (OTP, CAPTCHA). Replay waits
   for a gateway-notified human, then checks `resume_assert` before continuing.
 - `profile_hash` pins the macro to the browser profile it was recorded on.

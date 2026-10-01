@@ -235,3 +235,26 @@ func TestReplayErrorFormatting(t *testing.T) {
 	}
 	_ = fmt.Sprint(e)
 }
+
+func autofillStep(sel string) Step {
+	return Step{Action: json.RawMessage(`{"kind":"autofill","selector":"` + sel + `"}`)}
+}
+
+func TestReplayAutofillSetsSelectorOnRunner(t *testing.T) {
+	exec := &fakeExec{}
+	r := &Replayer{}
+	m := approvedMacro(autofillStep("#emailLogin"))
+	if err := r.Run(context.Background(), exec, nil, m); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	af, ok := exec.run[0].(session.AutofillAction)
+	if !ok {
+		t.Fatalf("step 0 is %T", exec.run[0])
+	}
+	if af.Selector != "#emailLogin" {
+		t.Fatalf("selector lost: %+v", af)
+	}
+	if af.TimeoutMS != 0 {
+		t.Fatalf("replayer must not override the recorded timeout: %+v", af)
+	}
+}
