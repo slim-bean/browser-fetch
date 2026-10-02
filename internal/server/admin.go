@@ -49,7 +49,8 @@ type replayRecord struct {
 	Duration  time.Duration
 	AbortedAt int // -1 when the replay ran to completion
 	Cause     string
-	Test      bool // agent test replay of an unapproved, editable-site draft
+	Test      bool   // agent test replay of an unapproved, editable-site draft
+	Dump      string // failure-time page state (URL/title/field probes) on abort
 }
 
 func NewAdmin(store *macro.Store, token string) *Admin {
@@ -59,7 +60,7 @@ func NewAdmin(store *macro.Store, token string) *Admin {
 // RecordReplay stores a replay outcome for the dashboard. The agent-facing
 // replay handler feeds it: recording outcomes is observability, not
 // authority.
-func (a *Admin) RecordReplay(macroID string, ok bool, d time.Duration, abortedAt int, cause string, test bool) {
+func (a *Admin) RecordReplay(macroID string, ok bool, d time.Duration, abortedAt int, cause string, test bool, dump string) {
 	if a == nil {
 		return
 	}
@@ -67,7 +68,7 @@ func (a *Admin) RecordReplay(macroID string, ok bool, d time.Duration, abortedAt
 	defer a.logMu.Unlock()
 	a.replays = append(a.replays, replayRecord{
 		At: time.Now().UTC(), MacroID: macroID, OK: ok, Duration: d,
-		AbortedAt: abortedAt, Cause: cause, Test: test,
+		AbortedAt: abortedAt, Cause: cause, Test: test, Dump: dump,
 	})
 	if len(a.replays) > 25 {
 		a.replays = a.replays[len(a.replays)-25:]
@@ -232,7 +233,7 @@ var dashboardTmpl = template.Must(template.New("dash").Parse(`<!doctype html>
 {{range .Replays}}
 <tr><td>{{.At.Format "15:04:05"}}</td><td>{{.MacroID}}{{if .Test}} <span class="draft">test</span>{{end}}</td>
  <td>{{if .OK}}ok{{else}}<b>aborted at step {{.AbortedAt}}</b>{{end}}</td>
- <td>{{.Duration}}{{if .Cause}} — {{.Cause}}{{end}}</td></tr>
+ <td>{{.Duration}}{{if .Cause}} — {{.Cause}}{{end}}{{if .Dump}}<br><code class="muted">{{.Dump}}</code>{{end}}</td></tr>
 {{else}}
 <tr><td colspan="4">none yet</td></tr>
 {{end}}

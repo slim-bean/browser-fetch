@@ -47,6 +47,20 @@ type ReplayError struct {
 	// Drift is the number of ladder candidates that missed before the step
 	// succeeded (0 when a step failed outright).
 	Drift int `json:"drift,omitempty"`
+	// FailureDump is the page state captured at the moment of failure:
+	// URL/title of the live tab plus presence/fill-state probes of the
+	// step's selectors. Presence-only, value-free (lengths, not contents).
+	FailureDump *FailureDump `json:"failure_dump,omitempty"`
+}
+
+// FailureDump answers "what did the page actually look like when this
+// failed?" without leaking values: selectors resolve to booleans and
+// lengths only.
+type FailureDump struct {
+	URL      string               `json:"url,omitempty"`
+	Title    string               `json:"title,omitempty"`
+	Fields   []session.FieldState `json:"fields,omitempty"`
+	DumpErrs []string             `json:"dump_errors,omitempty"`
 }
 
 func (e *ReplayError) Error() string {
@@ -91,27 +105,71 @@ func stepKind(s Step) string {
 
 func (r *Replayer) runStep(ctx context.Context, exec Executor, sess *session.Session, m *Macro, i int, step Step) error {
 	kind := stepKind(step)
+	fail := func(cause string) *ReplayError {
+		re := &ReplayError{Step: i, Kind: kind, Cause: cause}
+		re.FailureDump = r.dumpPage(ctx, exec, sess, step)
+		return re
+	}
 	switch kind {
 	case "pause":
 		return r.runPause(ctx, exec, sess, m, i, step)
 	case "type":
 		return r.runType(ctx, exec, sess, i, step)
 	case "click":
-		return r.runClick(ctx, exec, sess, i, step)
+		return r.runClick(ctx, exec, sess, i, step, fail)
 	case "autofill":
-		return r.runAutofill(ctx, exec, sess, i, step)
+		return r.runAutofill(ctx, exec, sess, i, step, fail)
 	case "navigate", "wait", "assert", "screenshot", "content", "download":
 		action, err := decodeMacroAction(step.Action)
 		if err != nil {
-			return &ReplayError{Step: i, Kind: kind, Cause: err.Error()}
+			return fail("bad action: " + err.Error())
 		}
 		if _, err := exec.Run(ctx, sess, action); err != nil {
-			return &ReplayError{Step: i, Kind: kind, Cause: err.Error()}
+			return fail(err.Error())
 		}
 		return nil
 	default:
-		return &ReplayError{Step: i, Kind: kind, Cause: "unknown action kind in macro"}
+		return fail("unknown action kind in macro")
 	}
+}
+
+// dumpPage captures the failure-time page state: identity (URL/title) plus
+// presence/fill-state probes for the step's own selectors. Probe failures
+// are recorded, never fatal — a dump is best-effort evidence on the way out.
+// Read-only and value-free: FieldState carries booleans and lengths only.
+func (r *Replayer) dumpPage(ctx context.Context, exec Executor, sess *session.Session, step Step) *FailureDump {
+	if sess == nil {
+		return nil
+	}
+	d := &FailureDump{}
+	if snap, err := sess.Snapshot(); err == nil {
+		d.URL, d.Title = snap.URL, snap.Title
+	} else {
+		d.DumpErrs = append(d.DumpErrs, "snapshot: "+err.Error())
+	}
+	var sels []string
+	var act struct {
+		Selector  string   `json:"selector"`
+		Selectors []string `json:"selectors"`
+	}
+	_ = json.Unmarshal(step.Action, &act)
+	if act.Selector != "" {
+		sels = append(sels, act.Selector)
+	}
+	sels = append(sels, act.Selectors...)
+	if step.Recorded != nil && step.Recorded.Element != nil {
+		sels = append(sels, step.Recorded.Element.Candidates...)
+	}
+	if len(sels) > 0 {
+		if res, err := exec.Run(ctx, sess, session.FieldsAction{Selectors: sels}); err == nil {
+			if fs, ok := res.([]session.FieldState); ok {
+				d.Fields = fs
+			}
+		} else {
+			d.DumpErrs = append(d.DumpErrs, "field probe: "+err.Error())
+		}
+	}
+	return d
 }
 
 // decodeMacroAction decodes a macro step's raw action JSON into the typed
@@ -217,16 +275,16 @@ func (r *Replayer) runType(ctx context.Context, exec Executor, sess *session.Ses
 // verifies the field carries a value before the flow continues. If the fill
 // never arrives (autofill disabled, profile moved, site markup changed),
 // replay aborts rather than proceeding with an empty form.
-func (r *Replayer) runAutofill(ctx context.Context, exec Executor, sess *session.Session, i int, step Step) error {
+func (r *Replayer) runAutofill(ctx context.Context, exec Executor, sess *session.Session, i int, step Step, fail func(string) *ReplayError) error {
 	var a session.AutofillAction
 	if err := json.Unmarshal(step.Action, &a); err != nil {
-		return &ReplayError{Step: i, Kind: "autofill", Cause: err.Error()}
+		return fail(err.Error())
 	}
 	if a.Selector == "" {
-		return &ReplayError{Step: i, Kind: "autofill", Cause: "autofill step lacks selector"}
+		return fail("autofill step lacks selector")
 	}
 	if _, err := exec.Run(ctx, sess, a); err != nil {
-		return &ReplayError{Step: i, Kind: "autofill", Cause: err.Error()}
+		return fail(err.Error())
 	}
 	return nil
 }
@@ -234,18 +292,18 @@ func (r *Replayer) runAutofill(ctx context.Context, exec Executor, sess *session
 // runClick builds the selector ladder from the recorded element: recorded
 // candidates first, then a generated text XPath (tier-2 fuzzy match). Ladder
 // misses surface in the evidence log via ClickResult and in ReplayError.Drift.
-func (r *Replayer) runClick(ctx context.Context, exec Executor, sess *session.Session, i int, step Step) error {
+func (r *Replayer) runClick(ctx context.Context, exec Executor, sess *session.Session, i int, step Step, fail func(string) *ReplayError) error {
 	var candidates []string
 	if step.Recorded != nil && step.Recorded.Element != nil {
 		candidates = append(candidates, step.Recorded.Element.Candidates...)
 		candidates = append(candidates, textXPaths(step.Recorded.Element, r.MinTextLenForXPath)...)
 	}
 	if len(candidates) == 0 {
-		return &ReplayError{Step: i, Kind: "click", Cause: "click step without recorded element candidates"}
+		return fail("click step without recorded element candidates")
 	}
 	res, err := exec.Run(ctx, sess, session.ClickAction{Candidates: candidates})
 	if err != nil {
-		return &ReplayError{Step: i, Kind: "click", Cause: err.Error()}
+		return fail(err.Error())
 	}
 	if cr, ok := res.(session.ClickResult); ok && cr.Misses > 0 {
 		// Soft drift: a fallback candidate matched. Visible in the evidence

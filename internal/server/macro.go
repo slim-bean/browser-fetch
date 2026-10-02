@@ -515,7 +515,13 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 		} else if runErr != nil {
 			cause = runErr.Error()
 		}
-		s.admin.RecordReplay(m.ID, runErr == nil, time.Since(started), aborted, cause, testReplay)
+		dump := ""
+		if reErr.FailureDump != nil {
+			if b, err := json.Marshal(reErr.FailureDump); err == nil {
+				dump = string(b)
+			}
+		}
+		s.admin.RecordReplay(m.ID, runErr == nil, time.Since(started), aborted, cause, testReplay, dump)
 	}()
 
 	result := map[string]any{
@@ -531,6 +537,9 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 			result["step_kind"] = reErr.Kind
 			result["cause"] = reErr.Cause
 			result["drift"] = reErr.Drift
+			if reErr.FailureDump != nil {
+				result["failure_dump"] = reErr.FailureDump
+			}
 		} else {
 			result["cause"] = runErr.Error()
 		}
