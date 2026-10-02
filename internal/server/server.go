@@ -39,6 +39,7 @@ import (
 	"github.com/slim-bean/browser-fetch/internal/metrics"
 	"github.com/slim-bean/browser-fetch/internal/reqlog"
 	"github.com/slim-bean/browser-fetch/internal/scheduler"
+	"github.com/slim-bean/browser-fetch/internal/secrets"
 	"github.com/slim-bean/browser-fetch/internal/session"
 	"github.com/slim-bean/browser-fetch/internal/urlguard"
 )
@@ -60,6 +61,23 @@ type Server struct {
 }
 
 func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
+	// The 1Password resolver is built at startup so a bad service account
+	// token fails loudly at boot, not mid-replay. Without a token the server
+	// runs resolver-less: type steps abort at replay (fail-closed).
+	var resolver macro.SecretResolver
+	if cfg.OpServiceAccountToken != "" {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		op, err := secrets.NewOnePassword(ctx, cfg.OpServiceAccountToken)
+		if err != nil {
+			log.Error("1password secret resolver unavailable; type steps will abort",
+				"err", err)
+		} else {
+			resolver = op
+			log.Info("1password secret resolver enabled",
+				"note", "op:// references resolve at replay time; values never logged")
+		}
+	}
 	s := &Server{
 		cfg:          cfg,
 		log:          log,
@@ -68,6 +86,7 @@ func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
 		ring:         reqlog.NewRing(cfg.DebugRing),
 		start:        time.Now(),
 		historySlots: make(chan struct{}, 2),
+		secrets:      resolver,
 		sched: scheduler.New[*browser.Result](scheduler.Options{
 			MaxSlots: cfg.MaxTabs,
 			HostGap:  cfg.HostGap,

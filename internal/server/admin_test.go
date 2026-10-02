@@ -1,7 +1,9 @@
 package server
 
 import (
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -110,6 +112,58 @@ func TestAdminEditClearsApproval(t *testing.T) {
 	}
 	if _, err := ms.store.Get("m-edit"); err == nil {
 		t.Fatal("deleted macro must be gone")
+	}
+}
+
+// TestAdminSetSecretPinsOpRef pins: set_secret attaches an op:// reference
+// (never a value) to a recorded type step, clears approval, and refuses
+// non-op payloads. clear_secret empties the reference again.
+func TestAdminSetSecretPinsOpRef(t *testing.T) {
+	_, ms := testServerWithMacros(t)
+	rec := macro.NewRecorder("m-secret", "example.com")
+	_ = rec.AddEvent([]byte(`{"ev":"click","element":{"candidates":["#login"],"role":"button","text":"Log in"},"url":"https://example.com/"}`))
+	_ = rec.AddEvent([]byte(`{"ev":"type","field":"password"}`))
+	if err := ms.store.Put(rec.Draft(), false); err != nil {
+		t.Fatalf("draft with pending secret must put: %v", err)
+	}
+
+	admin := NewAdmin(ms.store, "admin-secret")
+	h := admin.Handler()
+
+	// Non-op reference refused (fail re-renders the view with 200 + error text).
+	w := httptest.NewRecorder()
+	req := adminFormWithRef("set_secret", "m-secret", "admin-secret", "1", "hunter2")
+	h.ServeHTTP(w, req)
+	if !strings.Contains(w.Body.String(), "op:// reference") {
+		t.Fatalf("non-op ref must be refused with an explanation: %d %s", w.Code, w.Body.String())
+	}
+
+	// A value must never be stored: only op:// refs pass.
+	w = httptest.NewRecorder()
+	req = adminFormWithRef("set_secret", "m-secret", "admin-secret", "1", "op://fin-browser/TireRack/password")
+	h.ServeHTTP(w, req)
+	if w.Code != 303 {
+		t.Fatalf("set_secret: %d %s", w.Code, w.Body.String())
+	}
+	m, err := ms.store.Get("m-secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Steps[1].Secret != "op://fin-browser/TireRack/password" {
+		t.Fatalf("ref not attached: %q", m.Steps[1].Secret)
+	}
+	if m.Approved != nil {
+		t.Fatal("set_secret must clear approval")
+	}
+
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, adminForm("clear_secret", "m-secret", "admin-secret", "1"))
+	if w.Code != 303 {
+		t.Fatalf("clear_secret: %d %s", w.Code, w.Body.String())
+	}
+	m, _ = ms.store.Get("m-secret")
+	if m.Steps[1].Secret != "" {
+		t.Fatalf("ref not cleared: %q", m.Steps[1].Secret)
 	}
 }
 
@@ -287,4 +341,12 @@ func TestAdminPromoteRefusesOverApproved(t *testing.T) {
 	if orphans, _ := ms.store.ListOrphans(); len(orphans) != 1 {
 		t.Fatal("refused orphan must remain parked")
 	}
+}
+
+// adminFormWithRef builds a set_secret action form carrying a ref field.
+func adminFormWithRef(op, id, token, index, ref string) *http.Request {
+	form := url.Values{"t": {token}, "op": {op}, "id": {id}, "index": {index}, "ref": {ref}}
+	req := httptest.NewRequest("POST", "/action", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return req
 }
