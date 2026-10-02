@@ -159,6 +159,8 @@ func (s *Server) Handler() http.Handler {
 	// call would make the approval stamp meaningless. 410 tells old clients
 	// the authority is gone by design, not temporarily.
 	mux.Handle("POST /macro/approve", s.routeDriver("macro_approve", s.handleAgentApproveGone))
+	mux.Handle("POST /macro/put", s.routeDriver("macro_put", s.handleMacroPut))
+	mux.Handle("POST /macro/edit", s.routeDriver("macro_edit", s.handleMacroEdit))
 	mux.Handle("POST /macro/replay", s.routeDriver("macro_replay", s.handleMacroReplay))
 	mux.Handle("POST /macro/resume", s.routeDriver("macro_resume", s.handleMacroResume))
 	mux.Handle("GET /macros", s.routeDriver("macros", s.handleMacroList))

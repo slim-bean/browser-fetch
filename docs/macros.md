@@ -107,6 +107,47 @@ that Ed approves; runtime stays deterministic.
   `cause`, `drift`.
 - `POST /macro/resume` — signals a paused replay to continue (human completed
   the OTP/CAPTCHA step).
+- `POST /macro/put` — **agent-authored drafts, only on operator-designated
+  sites** (see below). Body: `{id, site, description?, steps:[{action, secret?}]}`
+  or `step` for a single-step macro. Creates an unapproved draft; the site
+  must be agent-editable. 403 `agent_edit_refused` otherwise.
+- `POST /macro/edit` — bounded op-based edits to an agent-owned draft on an
+  editable site: `{macro_id, ops:[{op:append_step|replace_step|drop_step|
+  move_step|set_description, index?, step?, secret?, description?}]}`.
+  Approved macros are refused (frozen to the agent); a refused op set is
+  never persisted.
+
+## Agent-editable sites (operator grant)
+
+For debugging iterations the operator can designate a **site** (not a macro)
+agent-editable in the admin band: the dashboard has one-click grant/revoke
+buttons per site in the store. Grants are stored in
+`agent-editable-sites.json` inside the macro store (0600) and audited like
+every admin action. While a grant is active the agent may:
+
+- author new draft macros for that site (`POST /macro/put`),
+- edit its own drafts (`POST /macro/edit`),
+- **test-replay** unapproved drafts on that site without approval.
+
+Test replays are labeled `test_replay: true` in the API response, the
+evidence log and the admin dashboard's replay list — they are never counted
+as approval and never recorded as production runs.
+
+What the grant never changes:
+
+- **Approval stays human-only.** An agent-authored macro is always a draft;
+  promoting it to production still requires the admin band approve action,
+  after human review of the exact step list.
+- **Approved macros are frozen to the agent**, even on editable sites. A
+  production change means: copy to a new draft, iterate, re-approve.
+- **Non-editable sites are unchanged**: no agent writes, no unapproved
+  replays.
+- **No new script authority**: the agent still supplies declarative steps
+  only; the gateway is still the only author of injected JavaScript; host
+  navigation still bounded by `-allow-hosts`.
+- **Revocation is immediate**: disabling a site stops authoring, editing and
+  test-replay for its drafts at the next request. Stored drafts remain (for
+  human review), but are inert.
 
 Macro endpoints require `-macro-store DIR` / `BROWSER_FETCH_MACRO_STORE`
 (0600 files; macro store disabled when unset). Replay of `type` steps needs a

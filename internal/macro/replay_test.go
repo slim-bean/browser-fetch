@@ -17,11 +17,16 @@ type fakeExec struct {
 	run     []session.Action
 	failOn  map[int]error // index into run
 	results []any
+	// fields answers FieldsAction probes when non-nil (failure-dump tests).
+	fields []session.FieldState
 }
 
 func (f *fakeExec) Run(ctx context.Context, sess *session.Session, a session.Action) (any, error) {
 	i := len(f.run)
 	f.run = append(f.run, a)
+	if fa, ok := a.(session.FieldsAction); ok && f.fields != nil {
+		return f.fieldsFor(fa), nil
+	}
 	if err, ok := f.failOn[i]; ok {
 		return nil, err
 	}
@@ -30,6 +35,25 @@ func (f *fakeExec) Run(ctx context.Context, sess *session.Session, a session.Act
 		res, f.results = f.results[0], f.results[1:]
 	}
 	return res, nil
+}
+
+// fieldsFor answers each requested selector from the scripted list; selectors
+// without a scripted answer report Found=false.
+func (f *fakeExec) fieldsFor(a session.FieldsAction) []session.FieldState {
+	bySel := map[string]session.FieldState{}
+	for _, fs := range f.fields {
+		bySel[fs.Selector] = fs
+	}
+	out := make([]session.FieldState, 0, len(a.Selectors))
+	for _, sel := range a.Selectors {
+		if fs, ok := bySel[sel]; ok {
+			fs.Selector = sel
+			out = append(out, fs)
+			continue
+		}
+		out = append(out, session.FieldState{Selector: sel})
+	}
+	return out
 }
 
 func approvedMacro(steps ...Step) *Macro {
