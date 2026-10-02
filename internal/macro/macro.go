@@ -94,6 +94,18 @@ type Approval struct {
 // approved: every type step references a secret (no inline values), pause
 // steps carry a reason, and steps are non-empty.
 func (m *Macro) Validate() error {
+	return m.validate(true)
+}
+
+// ValidateDraft is the draft-stage validation: recorded type steps may still
+// be missing their op:// reference (the human typed a value the recorder
+// redacted; the reference is attached later at the admin band). Everything
+// else is enforced identically.
+func (m *Macro) ValidateDraft() error {
+	return m.validate(false)
+}
+
+func (m *Macro) validate(requireSecretRefs bool) error {
 	if strings.TrimSpace(m.ID) == "" {
 		return errors.New("macro id is required")
 	}
@@ -118,7 +130,13 @@ func (m *Macro) Validate() error {
 			return fmt.Errorf("step %d: type step must reference a secret, not carry a value", i)
 		}
 		if a.Kind == "type" && s.Secret == "" && s.Pause == nil {
-			return fmt.Errorf("step %d: type step needs a secret reference", i)
+			if requireSecretRefs {
+				return fmt.Errorf("step %d: type step needs a secret reference", i)
+			}
+		} else if a.Kind == "type" && s.Secret != "" {
+			if !strings.HasPrefix(s.Secret, "op://") {
+				return fmt.Errorf("step %d: secret must be an op:// reference", i)
+			}
 		}
 		if a.Kind == "autofill" {
 			if a.Text != "" {
@@ -177,8 +195,12 @@ func sanitizeID(id string) string {
 
 // Put writes a macro atomically. Existing macros are never silently
 // overwritten unless the caller replaces an unapproved one.
+//
+// Draft validation applies: a recorded type step may lack its op:// reference
+// until the operator attaches one at the admin band. Approval re-validates
+// strictly, so a secret-less draft can never reach production replay.
 func (s *Store) Put(m *Macro, overwrite bool) error {
-	if err := m.Validate(); err != nil {
+	if err := m.ValidateDraft(); err != nil {
 		return err
 	}
 	s.mu.Lock()
@@ -250,7 +272,7 @@ func (s *Store) Update(id string, mutate func(*Macro)) error {
 	}
 	mutate(m)
 	m.Approved = nil // an edited macro is unapproved by definition
-	if err := m.Validate(); err != nil {
+	if err := m.ValidateDraft(); err != nil {
 		return err
 	}
 	return s.writeLocked(m)
@@ -339,7 +361,7 @@ func (s *Store) PromoteOrphan(id string) error {
 	if err := json.Unmarshal(buf, &m); err != nil {
 		return fmt.Errorf("orphan %q: %w", id, err)
 	}
-	if err := m.Validate(); err != nil {
+	if err := m.ValidateDraft(); err != nil {
 		return err
 	}
 	if existing, err := s.getLocked(id); err == nil && existing.Approved != nil {
