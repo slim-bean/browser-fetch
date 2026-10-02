@@ -504,6 +504,7 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 		Secrets:            s.secrets,
 		Pauser:             s.macros,
 		MinTextLenForXPath: 3,
+		TestReplay:         testReplay,
 	}
 	started := time.Now()
 	runErr := re.Run(r.Context(), s.sessions, sess, m)
@@ -516,7 +517,7 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 			cause = runErr.Error()
 		}
 		dump := ""
-		if reErr.FailureDump != nil {
+		if reErr != nil && reErr.FailureDump != nil {
 			if b, err := json.Marshal(reErr.FailureDump); err == nil {
 				dump = string(b)
 			}
