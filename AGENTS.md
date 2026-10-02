@@ -9,6 +9,10 @@ Chrome lifecycle/profile ownership is external (launcher, Kubernetes, pi-assista
 - `internal/browser`: default-context tab pool, settling, session leases.
   `currentPool` serializes Chrome-generation changes; each pool has its own allocator.
   In-flight requests may fail across restart; never automatically replay actions.
+  Distinguish request cancellation from a cancelled worker lifetime. Never requeue
+  dead/unparkable workers; wake waiters on release, retirement and allocation failure.
+  Session leases must release to their owning pool, not the current generation.
+  Opt-in recovery_live_test.go runs only against an isolated test Chrome.
 - `internal/session`, `internal/macro`: typed actions, assertions, evidence, human-
   recorded/approved deterministic flows. Preserve these separately from raw CDP.
   Read `docs/l1-design.md` and `docs/macros.md` before modifying them.

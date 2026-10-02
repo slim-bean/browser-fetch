@@ -27,12 +27,17 @@ type SessionTab struct {
 // Acquire leases a tab for a session. The returned release func must be called
 // exactly once; it re-parks the tab and returns it to the pool.
 func (m *Manager) Acquire(ctx context.Context) (*SessionTab, func(), error) {
-	p, err := m.pool.acquire(ctx)
+	pool, err := m.currentPool(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	p, err := pool.acquire(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
 	st := &SessionTab{m: m, p: p}
-	release := func() { m.pool.release(p, p.ctx.Err() == nil) }
+	// Return to the owning generation, even if Chrome restarts during the lease.
+	release := func() { pool.release(p, p.ctx.Err() == nil) }
 	return st, release, nil
 }
 

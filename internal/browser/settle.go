@@ -126,8 +126,8 @@ func (m *Manager) awaitReady(ctx context.Context, p *page) (snapshot, error) {
 			return snap, nil
 		}
 		if err != nil {
-			// A dead target is fatal; a mid-navigation read is not.
-			if isFatalTabErr(err) {
+			// A dead target/lifetime is fatal; a mid-navigation read is not.
+			if isFatalTabErr(p.ctx, err) {
 				return snapshot{}, &NavError{Err: err}
 			}
 			lastErr = err
@@ -163,7 +163,7 @@ func (m *Manager) waitOut(
 		}
 		snap, err := m.read(ctx, p)
 		if err != nil {
-			if isFatalTabErr(err) {
+			if isFatalTabErr(p.ctx, err) {
 				return latest, vendor, &NavError{Err: err}
 			}
 			// Transient: the challenge is probably navigating. Keep waiting.

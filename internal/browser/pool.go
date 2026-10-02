@@ -42,6 +42,7 @@ type pool struct {
 	mu      sync.Mutex
 	pages   []*page
 	free    chan *page
+	changed chan struct{} // closed/replaced under mu when a tab or creation slot becomes available
 	nextID  int
 	created int
 	busy    int
@@ -60,7 +61,7 @@ func newPool(m *Manager, alloc context.Context, size int) *pool {
 	if size < 1 {
 		size = 1
 	}
-	return &pool{m: m, alloc: alloc, size: size, free: make(chan *page, size)}
+	return &pool{m: m, alloc: alloc, size: size, free: make(chan *page, size), changed: make(chan struct{})}
 }
 
 func (p *pool) stat() PoolStat {
@@ -77,93 +78,91 @@ func (p *pool) stat() PoolStat {
 
 // acquire returns a ready tab, creating one if the pool is not yet full.
 func (p *pool) acquire(ctx context.Context) (*page, error) {
-	// A tab a human closed in the VNC is dead: its context is canceled and
-	// every CDP command on it fails. Detect that here instead of leasing
-	// corpses (the gateway does not subscribe to target-destroyed events, so
-	// pool state alone cannot tell a live idle tab from a dead one).
-	dead := func(pg *page) bool {
-		if pg.ctx.Err() == nil {
-			return false
-		}
-		p.m.log.Warn("retiring dead pooled tab", "page", pg.id, "err", pg.ctx.Err())
-		p.retire(pg)
-		return true
-	}
-	tryCreate := func() (*page, error) {
-		p.mu.Lock()
-		canCreate := p.created < p.size
-		if canCreate {
-			p.created++
-		}
-		p.mu.Unlock()
-		if !canCreate {
-			return nil, nil
-		}
-		pg, err := p.newPage()
-		if err != nil {
-			p.mu.Lock()
-			p.created--
-			p.mu.Unlock()
+	for {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		p.markBusy(+1)
-		return pg, nil
-	}
+		if err := p.alloc.Err(); err != nil {
+			return nil, err
+		}
 
-	// Fast path: a live idle tab.
-	for {
+		p.mu.Lock()
+		// Idle workers can lose their CDP connection without Chrome restarting.
+		// Discard them before any navigation; no request/action is being replayed.
 		select {
 		case pg := <-p.free:
-			if dead(pg) {
+			p.mu.Unlock()
+			if pg.ctx.Err() != nil {
+				p.retire(pg)
 				continue
 			}
 			p.markBusy(+1)
 			return pg, nil
 		default:
 		}
-		// No idle tab (or all idle ones were dead): create if capacity allows.
-		pg, err := tryCreate()
-		if err != nil {
-			return nil, err
+		canCreate := p.created < p.size
+		if canCreate {
+			p.created++
 		}
-		if pg != nil {
-			return pg, nil
-		}
-		// Pool at capacity with no live idle tab: wait for a release, skipping
-		// corpses as they come back.
-		select {
-		case pg := <-p.free:
-			if dead(pg) {
-				continue // freed capacity; loop retries creation
+		changed := p.changed
+		p.mu.Unlock()
+
+		if canCreate {
+			pg, err := p.newPage()
+			if err != nil {
+				p.mu.Lock()
+				p.created--
+				p.notifyLocked()
+				p.mu.Unlock()
+				return nil, err
 			}
 			p.markBusy(+1)
 			return pg, nil
+		}
+
+		// Retirement frees capacity without returning a tab. Wake up for both
+		// cases, otherwise waiters on a full pool can stall until their deadline.
+		select {
+		case <-changed:
 		case <-ctx.Done():
 			return nil, ctx.Err()
+		case <-p.alloc.Done():
+			return nil, p.alloc.Err()
 		}
 	}
+}
+
+func (p *pool) notifyLocked() {
+	close(p.changed)
+	p.changed = make(chan struct{})
 }
 
 // release parks a healthy tab back in the pool, or retires a broken one.
 func (p *pool) release(pg *page, healthy bool) {
 	p.markBusy(-1)
-	if !healthy {
+	if !healthy || pg.ctx.Err() != nil {
 		p.retire(pg)
 		return
 	}
 	pg.mu.Lock()
 	pg.uses++
 	pg.mu.Unlock()
-	p.park(pg)
+	if err := p.park(pg); err != nil || pg.ctx.Err() != nil {
+		p.retire(pg)
+		return
+	}
+	p.mu.Lock()
 	p.free <- pg
+	p.notifyLocked()
+	p.mu.Unlock()
 }
 
-// park navigates the tab away from the fetched page. Best effort: a failure
-// here does not invalidate the tab, the next navigation will overwrite it.
-func (p *pool) park(pg *page) {
+// Park using the worker's lifetime, not the finished request's context. Failure
+// retires the worker instead of circulating a broken or unreset tab forever.
+func (p *pool) park(pg *page) error {
 	ctx, cancel := context.WithTimeout(pg.ctx, 5*time.Second)
 	defer cancel()
-	_ = chromedp.Run(ctx, chromedp.Navigate("about:blank"))
+	return chromedp.Run(ctx, chromedp.Navigate("about:blank"))
 }
 
 func (p *pool) retire(pg *page) {
@@ -179,6 +178,7 @@ func (p *pool) retire(pg *page) {
 			break
 		}
 	}
+	p.notifyLocked()
 	p.mu.Unlock()
 	pg.mu.Lock()
 	uses := pg.uses

@@ -9,8 +9,8 @@
 //     impossible. Parallelism is therefore tabs, which is what we want anyway:
 //     tabs in the default browser context share cookies, so a challenge solved
 //     (or a login performed) in one tab benefits every later fetch.
-//   - Tabs are pooled and parked on about:blank between jobs. They are never
-//     closed, which also guarantees Chrome always has a target open.
+//   - Healthy tabs are pooled and parked on about:blank between jobs. Workers
+//     with dead contexts or failed parking are retired, not endlessly reused.
 package browser
 
 import (
@@ -258,6 +258,9 @@ func (m *Manager) Fetch(ctx context.Context, req Request) (*Result, error) {
 	}
 	healthy := true
 	defer func() { pool.release(p, healthy) }()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	log := m.log.With("page", p.id, "url", req.URL)
 
@@ -280,7 +283,7 @@ func (m *Manager) Fetch(ctx context.Context, req Request) (*Result, error) {
 		p.beginNav()
 		if err := chromedp.Run(navCtx, chromedp.Navigate(req.URL)); err != nil {
 			// A dead tab must not be reused.
-			if isFatalTabErr(err) {
+			if isFatalTabErr(p.ctx, err) {
 				healthy = false
 			}
 			// The caller's deadline takes precedence in the reported error.
@@ -296,7 +299,7 @@ func (m *Manager) Fetch(ctx context.Context, req Request) (*Result, error) {
 			res.Attempts = attempt
 			return res, nil
 		}
-		if isFatalTabErr(err) {
+		if isFatalTabErr(p.ctx, err) {
 			healthy = false
 			return nil, err
 		}
@@ -372,7 +375,12 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 	}
 }
 
-func isFatalTabErr(err error) bool {
+// A request timeout/cancellation does not necessarily kill its worker. But a
+// cancelled worker lifetime is permanent, even if Chrome's identity is unchanged.
+func isFatalTabErr(tabCtx context.Context, err error) bool {
+	if tabCtx.Err() != nil {
+		return true
+	}
 	if err == nil {
 		return false
 	}

@@ -172,6 +172,11 @@ func classify(err error, ctx context.Context) (string, int, string) {
 		return metrics.OutcomeTimeout, http.StatusGatewayTimeout, ""
 	}
 	if errors.Is(err, context.Canceled) {
+		if ctx.Err() == nil {
+			// The caller is still waiting: a worker/allocator lost its lifetime,
+			// not a client cancellation or elapsed request timeout.
+			return metrics.OutcomeUnavail, http.StatusServiceUnavailable, ""
+		}
 		return metrics.OutcomeTimeout, 499, ""
 	}
 	var navErr *browser.NavError

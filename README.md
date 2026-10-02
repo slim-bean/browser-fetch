@@ -269,8 +269,13 @@ IP+session+host. So the scheduler enforces:
   bytes, duration and queue wait. `/debug` keeps the last N in memory.
 - **Assist mode** logs a `WARN` naming the tab, and pending assists appear in
   `/healthz` and `/metrics` (`browser_fetch_assists_pending`).
-- **Tabs are never closed**, only parked on `about:blank`, so Chrome always has
-  a target and cookies stay shared. Broken tabs are retired and replaced.
+- **Healthy workers are reused**, parked on `about:blank` between requests.
+  Dead worker contexts and failed parking are retired; the next request gets a
+  usable worker even when Chrome itself has not restarted. Cancelling a single
+  request does not retire an otherwise healthy worker. In-flight failures are
+  returned, never automatically replayed, and queued requests are woken when
+  retirement frees capacity. A worker cancellation with a still-active caller is
+  reported as `chrome_unavailable` (503), not a client-cancelled timeout (499).
 - **Chrome lifecycle** remains external: launch it yourself or use pi-assistant.
   With an HTTP CDP endpoint, the gateway checks Chrome's websocket identity before
   each fetch and replaces its allocator/tab pool after a restart. In-flight work
@@ -301,6 +306,15 @@ go test ./...              # scheduler pacing, URL guard, challenge detection
 go test -race ./...
 go vet ./... && gofmt -l .
 ```
+
+Browser-pool unit tests use a synthetic CDP endpoint, not a real browser. The
+optional `TestLivePoolRecovery` test requires `BROWSER_FETCH_TEST_CDP_URL` pointing
+at an **isolated test Chrome**, never a personal/active profile. It exercises idle
+and in-flight worker disconnections, caller cancellation, and recovery without
+navigation replay. `TestZZLiveWorkerContext` similarly requires the explicit
+`BROWSER_FETCH_TEST_CHROME_URL` and uses a synthetic page, not a public website.
+`../pi-assistant/test/live.ts` supplies its temporary browser for both tests
+alongside full gateway/browser lifecycle checks.
 
 `internal/challenge/testdata/` holds two real captured pages, with origins
 scrubbed: a captcha interstitial (must be detected) and a content page whose

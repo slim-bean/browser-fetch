@@ -3,6 +3,8 @@ package browser
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"testing"
 	"time"
@@ -10,13 +12,19 @@ import (
 	"github.com/chromedp/chromedp"
 )
 
-// TestZZLiveWorkerContext connects to a real Chrome DevTools endpoint (default
-// http://127.0.0.1:9222, override with BROWSER_FETCH_TEST_CHROME_URL), creates
-// a worker page exactly like pool.newPage does (BackgroundTabs=true path), and
-// then runs chromedp.Run on the page context. It fails if Run returns
-// ErrInvalidContext. Skips when no Chrome is reachable.
+// TestZZLiveWorkerContext requires an isolated Chrome endpoint explicitly set
+// in BROWSER_FETCH_TEST_CHROME_URL. It creates a BackgroundTabs worker and runs
+// chromedp.Run on its context. Ordinary tests never probe a personal browser.
 func TestZZLiveWorkerContext(t *testing.T) {
-	url := envOr("BROWSER_FETCH_TEST_CHROME_URL", "http://127.0.0.1:9222")
+	url := os.Getenv("BROWSER_FETCH_TEST_CHROME_URL")
+	if url == "" {
+		t.Skip("requires an isolated Chrome via BROWSER_FETCH_TEST_CHROME_URL")
+	}
+	fixture := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte("<html><head><title>Worker context fixture</title></head><body>synthetic content</body></html>"))
+	}))
+	defer fixture.Close()
 	root := context.Background()
 	m := New(root, Options{
 		ChromeURL:      url,
@@ -29,7 +37,7 @@ func TestZZLiveWorkerContext(t *testing.T) {
 	allocCtx, cancel := context.WithTimeout(root, 5*time.Second)
 	defer cancel()
 	if err := m.Probe(allocCtx); err != nil {
-		t.Skipf("no Chrome at %s: %v", url, err)
+		t.Fatalf("configured test Chrome unavailable at %s: %v", url, err)
 	}
 
 	pool, err := m.currentPool(root)
@@ -44,7 +52,7 @@ func TestZZLiveWorkerContext(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(pg.ctx, 15*time.Second)
 	defer cancel()
-	if err := chromedp.Run(ctx, chromedp.Navigate("https://example.com")); err != nil {
+	if err := chromedp.Run(ctx, chromedp.Navigate(fixture.URL)); err != nil {
 		if errors.Is(err, chromedp.ErrInvalidContext) {
 			t.Fatalf("Run on fresh worker page context: invalid context")
 		}
@@ -54,12 +62,8 @@ func TestZZLiveWorkerContext(t *testing.T) {
 	if err := chromedp.Run(ctx, chromedp.Title(&title)); err != nil {
 		t.Fatalf("Title: %v", err)
 	}
-	t.Logf("navigate+title ok, title=%q", title)
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if title != "Worker context fixture" {
+		t.Fatalf("unexpected title %q", title)
 	}
-	return def
+	t.Logf("navigate+title ok, title=%q", title)
 }
