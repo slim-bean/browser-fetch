@@ -35,6 +35,12 @@ type Replayer struct {
 	// MinTextLenForXPath: recorded element text shorter than this is too
 	// ambiguous for a text XPath candidate.
 	MinTextLenForXPath int
+
+	// TestReplay permits running an unapproved macro. The server sets it
+	// only when the operator has designated the macro's site agent-editable
+	// (AgentTestReplayable); the flag exists so Run's approval gate stays
+	// the single chokepoint for production replays.
+	TestReplay bool
 }
 
 // ReplayError reports where a replay stopped and why. Errors are
@@ -74,10 +80,12 @@ type Executor interface {
 	Run(ctx context.Context, sess *session.Session, a session.Action) (any, error)
 }
 
-// Run executes every step of an approved macro in order. Replay aborts at the
-// first failed step — it never improvises.
+// Run executes every step of the macro in order. Replay aborts at the
+// first failed step — it never improvises. Unapproved macros run only when
+// TestReplay is set (agent test replay on an operator-granted editable site;
+// the server verifies the grant before constructing the Replayer).
 func (r *Replayer) Run(ctx context.Context, exec Executor, sess *session.Session, m *Macro) error {
-	if m.Approved == nil {
+	if m.Approved == nil && !r.TestReplay {
 		return fmt.Errorf("macro %q is not approved; a human must review the recording first", m.ID)
 	}
 	if err := m.Validate(); err != nil {
