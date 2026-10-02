@@ -285,6 +285,165 @@ func (s *Server) handleAgentApproveGone(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// ---- agent-authored drafts (operator-designated sites only) ---------------------
+//
+// When the operator marks a site agent-editable in the admin band, the agent
+// may author and edit DRAFT macros for that site and test-replay them without
+// approval. Approved macros stay frozen everywhere; approval still requires
+// the admin band. A draft written here records its authorship.
+
+// agentMacroPayload is the strict input schema for /macro/put.
+type agentMacroPayload struct {
+	ID          string          `json:"id"`
+	Site        string          `json:"site"`
+	Description string          `json:"description,omitempty"`
+	Steps       []macro.Step    `json:"steps"`
+	Step        json.RawMessage `json:"step,omitempty"` // convenience: single-step macros
+}
+
+func (s *Server) handleMacroPut(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMacros(w) {
+		return
+	}
+	var req agentMacroPayload
+	if err := decodeBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error(), Code: "bad_request"})
+		return
+	}
+	if req.ID == "" || req.Site == "" {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "id and site are required", Code: "bad_request"})
+		return
+	}
+	steps := req.Steps
+	if len(steps) == 0 && len(req.Step) > 0 {
+		steps = []macro.Step{{Action: req.Step}}
+	}
+	m := &macro.Macro{
+		ID:          req.ID,
+		Site:        req.Site,
+		Description: req.Description,
+		Created:     time.Now().UTC(),
+		Steps:       steps,
+	}
+	if err := s.macros.store.AgentPut(m, false); err != nil {
+		writeJSON(w, http.StatusForbidden, errorBody{Error: err.Error(), Code: "agent_edit_refused"})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{
+		"macro_id": m.ID, "steps": len(m.Steps), "approved": false,
+		"note": "agent-authored draft; test-replayable while the site is agent-editable; approval still requires the admin band",
+	})
+}
+
+// editOp is one strict, bounded mutation. Nothing here can grant approval,
+// widen the site allowlist, or touch another site.
+type editOp struct {
+	Op     string          `json:"op"`
+	Index  int             `json:"index"`
+	Step   json.RawMessage `json:"step,omitempty"`
+	Secret string          `json:"secret,omitempty"`
+	Descr  string          `json:"description,omitempty"`
+}
+
+type editRequest struct {
+	MacroID string   `json:"macro_id"`
+	Ops     []editOp `json:"ops"`
+}
+
+func (s *Server) handleMacroEdit(w http.ResponseWriter, r *http.Request) {
+	if !s.requireMacros(w) {
+		return
+	}
+	var req editRequest
+	if err := decodeBody(r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: err.Error(), Code: "bad_request"})
+		return
+	}
+	if req.MacroID == "" || len(req.Ops) == 0 {
+		writeJSON(w, http.StatusBadRequest, errorBody{Error: "macro_id and at least one op are required", Code: "bad_request"})
+		return
+	}
+	err := s.macros.store.AgentUpdate(req.MacroID, func(m *macro.Macro) {
+		for _, op := range req.Ops {
+			applyEditOp(m, op)
+		}
+		if req.Ops[len(req.Ops)-1].Descr != "" {
+			m.Description = req.Ops[len(req.Ops)-1].Descr
+		}
+	})
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, errorBody{Error: err.Error(), Code: "agent_edit_refused"})
+		return
+	}
+	m, err := s.macros.store.Get(req.MacroID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, errorBody{Error: err.Error(), Code: "macro_store_failed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"macro_id": m.ID, "steps": len(m.Steps), "approved": false,
+	})
+}
+
+// applyEditOp applies one bounded op. Unknown ops and out-of-bounds indexes
+// are recorded as malformed steps — the outer Update re-validates and an
+// invalid result is never persisted.
+func applyEditOp(m *macro.Macro, op editOp) {
+	switch op.Op {
+	case "append_step":
+		if len(op.Step) == 0 {
+			return
+		}
+		step := macro.Step{Action: op.Step}
+		if op.Secret != "" {
+			step.Secret = op.Secret
+		}
+		m.Steps = append(m.Steps, step)
+	case "replace_step":
+		if op.Index < 0 || op.Index >= len(m.Steps) || len(op.Step) == 0 {
+			return
+		}
+		step := macro.Step{Action: op.Step}
+		if op.Secret != "" {
+			step.Secret = op.Secret
+		}
+		m.Steps[op.Index] = step
+	case "drop_step":
+		if op.Index < 0 || op.Index >= len(m.Steps) {
+			return
+		}
+		m.Steps = append(m.Steps[:op.Index], m.Steps[op.Index+1:]...)
+	case "move_step":
+		j := op.Index + opIndexDelta(op)
+		if op.Index < 0 || op.Index >= len(m.Steps) || j < 0 || j >= len(m.Steps) {
+			return
+		}
+		m.Steps[op.Index], m.Steps[j] = m.Steps[j], m.Steps[op.Index]
+	case "set_description":
+		m.Description = op.Descr
+	}
+}
+
+func opIndexDelta(op editOp) int {
+	var d struct {
+		Delta int `json:"delta"`
+	}
+	_ = json.Unmarshal(op.Step, &d) // move_step carries {"delta":±1} in step
+	if d.Delta == 0 {
+		var dir struct {
+			Direction string `json:"direction"`
+		}
+		_ = json.Unmarshal(op.Step, &dir)
+		switch dir.Direction {
+		case "up":
+			return -1
+		case "down":
+			return 1
+		}
+	}
+	return d.Delta
+}
+
 // ---- replay ---------------------------------------------------------------------
 // Approval used to be handled here (POST /macro/approve with {macro_id, by}).
 // It moved to the human-only admin band (internal/server/admin.go): an
@@ -314,9 +473,20 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorBody{Error: err.Error(), Code: "not_found"})
 		return
 	}
+	// Two replay classes: production (approved macro, any site) and agent
+	// test replay (unapproved draft on an operator-designated site). Test
+	// replays are labeled in the response, the evidence log and the admin
+	// dashboard; nothing about them grants approval.
+	testReplay := false
 	if m.Approved == nil {
-		writeJSON(w, http.StatusForbidden, errorBody{Error: "macro is not approved; a human must review the recording first", Code: "unapproved_macro"})
-		return
+		if !s.macros.store.AgentTestReplayable(m) {
+			writeJSON(w, http.StatusForbidden, errorBody{
+				Error: "macro is not approved; a human must review the recording first (or mark its site agent-editable in the admin band)",
+				Code:  "unapproved_macro",
+			})
+			return
+		}
+		testReplay = true
 	}
 
 	sess, ownedSession, err := s.openReplaySession(r, req, m)
@@ -345,13 +515,14 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 		} else if runErr != nil {
 			cause = runErr.Error()
 		}
-		s.admin.RecordReplay(m.ID, runErr == nil, time.Since(started), aborted, cause)
+		s.admin.RecordReplay(m.ID, runErr == nil, time.Since(started), aborted, cause, testReplay)
 	}()
 
 	result := map[string]any{
 		"macro_id":    m.ID,
 		"session_id":  sess.ID,
 		"duration_ms": time.Since(started).Milliseconds(),
+		"test_replay": testReplay,
 	}
 	if runErr != nil {
 		var reErr *macro.ReplayError
@@ -363,20 +534,36 @@ func (s *Server) handleMacroReplay(w http.ResponseWriter, r *http.Request) {
 		} else {
 			result["cause"] = runErr.Error()
 		}
-		result["evidence"] = evidenceView(sess)
+		result["evidence"] = evidenceViewFor(sess, testReplay)
 		log.Warn("macro replay aborted", "macro", m.ID, "err", runErr)
 		writeJSON(w, http.StatusConflict, result)
 		return
 	}
 	result["ok"] = true
 	result["steps"] = len(m.Steps)
-	result["evidence"] = evidenceView(sess)
+	result["evidence"] = evidenceViewFor(sess, testReplay)
 	log.Info("macro replay complete", "macro", m.ID)
 	writeJSON(w, http.StatusOK, result)
 }
 
 func evidenceView(sess *session.Session) []session.ActionRecord {
 	return sess.Records()
+}
+
+// evidenceViewFor prefixes the session action log with a test-replay marker
+// so a labeled test run is recognizable inside its own evidence output.
+func evidenceViewFor(sess *session.Session, testReplay bool) []session.ActionRecord {
+	records := sess.Records()
+	if !testReplay {
+		return records
+	}
+	marker := session.ActionRecord{
+		At:     time.Now().UTC(),
+		Action: "replay_marker",
+		OK:     true,
+		Detail: "agent test replay of an unapproved draft on an operator-designated editable site; not an approved production run",
+	}
+	return append([]session.ActionRecord{marker}, records...)
 }
 
 func (s *Server) openReplaySession(r *http.Request, req replayRequest, m *macro.Macro) (*session.Session, bool, error) {

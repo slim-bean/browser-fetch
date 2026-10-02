@@ -173,7 +173,7 @@ func TestAdminDashboardShowsState(t *testing.T) {
 		t.Fatal(err)
 	}
 	admin := NewAdmin(ms.store, "admin-secret")
-	admin.RecordReplay("m-ui", false, 1200, 0, "selector miss")
+	admin.RecordReplay("m-ui", false, 1200, 0, "selector miss", false)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest("GET", "/?t=admin-secret", nil)

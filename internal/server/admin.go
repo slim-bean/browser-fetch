@@ -49,6 +49,7 @@ type replayRecord struct {
 	Duration  time.Duration
 	AbortedAt int // -1 when the replay ran to completion
 	Cause     string
+	Test      bool // agent test replay of an unapproved, editable-site draft
 }
 
 func NewAdmin(store *macro.Store, token string) *Admin {
@@ -58,7 +59,7 @@ func NewAdmin(store *macro.Store, token string) *Admin {
 // RecordReplay stores a replay outcome for the dashboard. The agent-facing
 // replay handler feeds it: recording outcomes is observability, not
 // authority.
-func (a *Admin) RecordReplay(macroID string, ok bool, d time.Duration, abortedAt int, cause string) {
+func (a *Admin) RecordReplay(macroID string, ok bool, d time.Duration, abortedAt int, cause string, test bool) {
 	if a == nil {
 		return
 	}
@@ -66,7 +67,7 @@ func (a *Admin) RecordReplay(macroID string, ok bool, d time.Duration, abortedAt
 	defer a.logMu.Unlock()
 	a.replays = append(a.replays, replayRecord{
 		At: time.Now().UTC(), MacroID: macroID, OK: ok, Duration: d,
-		AbortedAt: abortedAt, Cause: cause,
+		AbortedAt: abortedAt, Cause: cause, Test: test,
 	})
 	if len(a.replays) > 25 {
 		a.replays = a.replays[len(a.replays)-25:]
@@ -145,6 +146,12 @@ type dashboardData struct {
 	Orphans []string // parked drafts from failed stores, recoverable here
 	Audit   []auditEntry
 	Replays []replayRecord
+	// AgentEditableSites: sites the operator has granted agent edit rights
+	// over (drafts + test replays). Grants and revocations happen here only.
+	AgentEditableSites []macro.EditableSite
+	// EditableToggleSites: distinct sites in the store without a grant, so
+	// the operator can grant from this page without typing site names.
+	EditableToggleSites []string
 }
 
 var dashboardTmpl = template.Must(template.New("dash").Parse(`<!doctype html>
@@ -197,11 +204,33 @@ var dashboardTmpl = template.Must(template.New("dash").Parse(`<!doctype html>
 </table>
 </section>
 <section>
+<h2>Agent-editable sites <span class="muted">(operator grant: the agent may author, edit and test-replay drafts on these sites; approved macros stay frozen)</span></h2>
+<table>
+<tr><th>Site</th><th>Granted</th><th>By</th><th>Note</th><th>Actions</th></tr>
+{{range .AgentEditableSites}}
+<tr><td>{{.Site}}</td><td>{{.GrantedAt.Format "2006-01-02 15:04"}}</td><td>{{.GrantedBy}}</td><td>{{.Note}}</td>
+<td><form method="post" action="/action"><input type="hidden" name="t" value="{{$t}}">
+  <input type="hidden" name="op" value="disable_agent_edit"><input type="hidden" name="site" value="{{.Site}}">
+  <button>revoke</button></form></td></tr>
+{{else}}
+<tr><td colspan="5">none — the agent cannot author or edit any macros</td></tr>
+{{end}}
+</table>
+{{if .EditableToggleSites}}
+<p class="muted">Sites in the store without a grant:</p>
+{{range .EditableToggleSites}}
+<form method="post" action="/action" style="display:inline;margin-right:1rem"><input type="hidden" name="t" value="{{$t}}">
+  <input type="hidden" name="op" value="enable_agent_edit"><input type="hidden" name="site" value="{{.}}">
+  <button>allow agent edits: {{.}}</button></form>
+{{end}}
+{{end}}
+</section>
+<section>
 <h2>Recent replays <span class="muted">(triggered by the agent, shown here for audit)</span></h2>
 <table>
 <tr><th>When</th><th>Macro</th><th>Result</th><th>Detail</th></tr>
 {{range .Replays}}
-<tr><td>{{.At.Format "15:04:05"}}</td><td>{{.MacroID}}</td>
+<tr><td>{{.At.Format "15:04:05"}}</td><td>{{.MacroID}}{{if .Test}} <span class="draft">test</span>{{end}}</td>
  <td>{{if .OK}}ok{{else}}<b>aborted at step {{.AbortedAt}}</b>{{end}}</td>
  <td>{{.Duration}}{{if .Cause}} — {{.Cause}}{{end}}</td></tr>
 {{else}}
@@ -258,9 +287,28 @@ func (a *Admin) handleDashboard(w http.ResponseWriter, r *http.Request) {
 		rows = append(rows, row)
 	}
 	a.logMu.Lock()
+	granted := map[string]bool{}
+	for _, e := range a.store.AgentEditableSites() {
+		granted[e.Site] = true
+	}
+	// Sites from stored macros that have no grant yet: one-click grant UI.
+	seen := map[string]bool{}
+	var toggle []string
+	for _, id := range ids {
+		m, err := a.store.Get(id)
+		if err != nil || m.Site == "" || seen[m.Site] {
+			continue
+		}
+		seen[m.Site] = true
+		if !granted[m.Site] {
+			toggle = append(toggle, m.Site)
+		}
+	}
 	data := dashboardData{Token: a.tokenVal, Macros: rows,
-		Audit:   append([]auditEntry(nil), a.audit...),
-		Replays: append([]replayRecord(nil), a.replays...)}
+		Audit:               append([]auditEntry(nil), a.audit...),
+		Replays:             append([]replayRecord(nil), a.replays...),
+		AgentEditableSites:  a.store.AgentEditableSites(),
+		EditableToggleSites: toggle}
 	a.logMu.Unlock()
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = dashboardTmpl.Execute(w, data)
@@ -419,6 +467,16 @@ func (a *Admin) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "discard_orphan":
 		err = a.store.DiscardOrphan(id)
 		note = "parked draft discarded by human at admin band"
+	case "enable_agent_edit":
+		a.siteAction(w, r, op, func(site string) error {
+			return a.store.EnableAgentEditable(site, "ed (admin band)", r.FormValue("note"))
+		}, "agent edit grant recorded by human at admin band")
+		return
+	case "disable_agent_edit":
+		a.siteAction(w, r, op, func(site string) error {
+			return a.store.DisableAgentEditable(site)
+		}, "agent edit grant revoked by human at admin band")
+		return
 	case "move_up", "move_down":
 		if !hasIdx {
 			a.fail(w, id, op+" needs an index", nil)
@@ -447,6 +505,24 @@ func (a *Admin) handleAction(w http.ResponseWriter, r *http.Request) {
 	a.auditf(op, id, note)
 	log.Info("admin action", "op", op, "macro", id)
 	http.Redirect(w, r, redirectTarget(op, id, a.tokenVal), http.StatusSeeOther)
+}
+
+// siteAction runs a site-scoped admin op (agent-edit grants/revocations),
+// audits it, and redirects to the dashboard. Site ops carry no macro id.
+func (a *Admin) siteAction(w http.ResponseWriter, r *http.Request, op string, run func(site string) error, note string) {
+	site := r.FormValue("site")
+	if site == "" {
+		http.Error(w, op+" needs a site", http.StatusBadRequest)
+		return
+	}
+	if err := run(site); err != nil {
+		logx.From(r.Context()).Warn("admin action failed", "op", op, "site", site, "err", err)
+		http.Error(w, op+" failed: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	a.auditf(op, "", note+": "+site)
+	logx.From(r.Context()).Info("admin action", "op", op, "site", site)
+	http.Redirect(w, r, "/?t="+a.tokenVal, http.StatusSeeOther)
 }
 
 func redirectTarget(op, id, token string) string {

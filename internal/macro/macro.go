@@ -146,15 +146,16 @@ func (m *Macro) Validate() error {
 // encrypted-at-rest location; here we only enforce atomic writes and
 // 0600/0700 permissions.
 type Store struct {
-	dir string
-	mu  sync.Mutex
+	dir   string
+	mu    sync.Mutex
+	sites *editableRegistry // operator-designated agent-editable sites
 }
 
 func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &Store{dir: dir}, nil
+	return &Store{dir: dir, sites: openEditableRegistry(dir)}, nil
 }
 
 func (s *Store) path(id string) string {
@@ -424,4 +425,82 @@ func HashProfile(profileDir string) (string, error) {
 		}
 	}
 	return fmt.Sprintf("sha256:%x", h.Sum(nil)), nil
+}
+
+// ---- agent-editable surface ----------------------------------------------------
+//
+// Operator-granted agent edit rights, per site. Every method here refuses
+// unless the operator has marked the site agent-editable in the admin band;
+// the agent-facing HTTP surface calls only these methods, and the admin band
+// is the only caller of the registry mutators. Invariants:
+//   - the agent can create and edit DRAFTS on editable sites only;
+//   - approved macros are frozen to the agent everywhere (approval certifies
+//     the exact step list; a change means a new draft + fresh approval);
+//   - an agent-authored draft records its authorship in the macro itself.
+
+// AgentEditable reports whether the operator currently allows the agent to
+// author/edit/test macros for this site.
+func (s *Store) AgentEditable(site string) bool {
+	return s.sites.Enabled(site)
+}
+
+// AgentPut writes an agent-authored draft. The macro must be unapproved
+// (an agent-authored "approval" would certify nothing) and its site must be
+// agent-editable. An existing approved macro with the same id is never
+// overwritten; an existing draft is overwritten only with overwrite=true.
+func (s *Store) AgentPut(m *Macro, overwrite bool) error {
+	if m == nil {
+		return errors.New("macro is required")
+	}
+	if m.Approved != nil {
+		return errors.New("agent-authored macros are drafts; approval happens only in the admin band")
+	}
+	if !s.sites.Enabled(m.Site) {
+		return fmt.Errorf("site %q is not agent-editable; ask the operator to enable it in the admin band", m.Site)
+	}
+	// An approved macro is never replaced through the agent path, regardless
+	// of overwrite: the operator's approval certifies the exact stored steps.
+	if existing, err := s.Get(m.ID); err == nil && existing.Approved != nil {
+		return fmt.Errorf("macro %q is approved and frozen to the agent; revoke it in the admin band first", m.ID)
+	}
+	return s.Put(m, overwrite)
+}
+
+// AgentUpdate edits a draft in place (agent path). Refuses approved macros
+// (frozen) and non-editable sites. The mutate function cannot grant approval:
+// the approval stamp is cleared before persisting.
+func (s *Store) AgentUpdate(id string, mutate func(*Macro)) error {
+	m, err := s.Get(id)
+	if err != nil {
+		return err
+	}
+	if m.Approved != nil {
+		return fmt.Errorf("macro %q is approved and frozen to the agent; copy it to a new draft instead", id)
+	}
+	if !s.sites.Enabled(m.Site) {
+		return fmt.Errorf("site %q is not agent-editable; ask the operator to enable it in the admin band", m.Site)
+	}
+	return s.Update(id, mutate)
+}
+
+// AgentEditableSites lists current grants (admin dashboard view).
+func (s *Store) AgentEditableSites() []EditableSite {
+	return s.sites.List()
+}
+
+// EnableAgentEditable grants agent edit rights for a site. Admin band only.
+func (s *Store) EnableAgentEditable(site, by, note string) error {
+	return s.sites.Enable(site, by, note)
+}
+
+// DisableAgentEditable revokes the grant. Admin band only.
+func (s *Store) DisableAgentEditable(site string) error {
+	return s.sites.Disable(site)
+}
+
+// AgentTestReplayable reports whether a macro may run without approval:
+// exactly when its site is operator-designated agent-editable. Production
+// replay (approved macros on any site) never consults this.
+func (s *Store) AgentTestReplayable(m *Macro) bool {
+	return m.Approved == nil && s.sites.Enabled(m.Site)
 }
