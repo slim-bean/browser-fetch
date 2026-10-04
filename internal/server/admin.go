@@ -322,6 +322,7 @@ type macroStepView struct {
 	Summary    string
 	HasElement bool
 	JSON       string
+	Secret     string
 }
 
 type macroViewData struct {
@@ -369,6 +370,14 @@ var macroTmpl = template.Must(template.New("macro").Parse(`<!doctype html>
    <form method="post" action="/action"><input type="hidden" name="t" value="{{$t}}">
      <input type="hidden" name="op" value="move_down"><input type="hidden" name="id" value="{{$.Macro.ID}}">
      <input type="hidden" name="index" value="{{.Index}}"><button>&darr;</button></form>
+   {{if eq .Kind "type"}}
+   <form method="post" action="/action" style="display:inline-flex;gap:.25rem">
+     <input type="hidden" name="t" value="{{$t}}">
+     <input type="hidden" name="op" value="set_secret"><input type="hidden" name="id" value="{{$.Macro.ID}}">
+     <input type="hidden" name="index" value="{{.Index}}">
+     <input type="text" name="ref" size="28" placeholder="op://vault/item/field" value="{{.Secret}}">
+     <button>set ref</button></form>
+   {{end}}
  </td>
 </tr>
 {{end}}
@@ -402,6 +411,7 @@ func (a *Admin) handleView(w http.ResponseWriter, r *http.Request) {
 			Index: i, Kind: action.Kind, Summary: summary,
 			HasElement: s.Recorded != nil && s.Recorded.Element != nil,
 			JSON:       string(recordedJSON(s)),
+			Secret:     s.Secret,
 		})
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -451,6 +461,33 @@ func (a *Admin) handleAction(w http.ResponseWriter, r *http.Request) {
 	case "delete":
 		err = a.store.Delete(id)
 		note = "deleted by human at admin band"
+	case "set_secret":
+		if !hasIdx {
+			a.fail(w, id, "set_secret needs an index", nil)
+			return
+		}
+		ref := strings.TrimSpace(r.FormValue("ref"))
+		if !strings.HasPrefix(ref, "op://") {
+			a.fail(w, id, "set_secret needs an op:// reference (a plaintext value must never be stored)", nil)
+			return
+		}
+		err = a.store.Update(id, func(m *macro.Macro) {
+			if idx >= 0 && idx < len(m.Steps) {
+				m.Steps[idx].Secret = ref
+			}
+		})
+		note = "secret reference attached by human at admin band (reference only, never a value)"
+	case "clear_secret":
+		if !hasIdx {
+			a.fail(w, id, "clear_secret needs an index", nil)
+			return
+		}
+		err = a.store.Update(id, func(m *macro.Macro) {
+			if idx >= 0 && idx < len(m.Steps) {
+				m.Steps[idx].Secret = ""
+			}
+		})
+		note = "secret reference cleared by human at admin band"
 	case "drop_step":
 		if !hasIdx {
 			a.fail(w, id, "drop_step needs an index", nil)

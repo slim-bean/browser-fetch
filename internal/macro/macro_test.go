@@ -35,6 +35,28 @@ func TestValidate(t *testing.T) {
 		t.Fatal("type step without secret must be rejected")
 	}
 
+	// Draft validation intentionally permits the pending-secret state a fresh
+	// recording produces (recorder redacts the typed value; the reference is
+	// attached later at the admin band).
+	if err := testMacro().ValidateDraft(); err != nil {
+		t.Fatalf("valid draft rejected: %v", err)
+	}
+	d := testMacro()
+	d.Steps[1].Secret = ""
+	if err := d.ValidateDraft(); err != nil {
+		t.Fatalf("draft with pending secret must pass draft validation: %v", err)
+	}
+	d = testMacro()
+	d.Steps[1].Secret = "hunter2"
+	if err := d.ValidateDraft(); err == nil {
+		t.Fatal("draft secret ref must still be an op:// reference")
+	}
+	d = testMacro()
+	d.Steps[1].Action = json.RawMessage(`{"kind":"type","field":"password","text":"hunter2"}`)
+	if err := d.ValidateDraft(); err == nil {
+		t.Fatal("inline secret value must be rejected even in a draft")
+	}
+
 	m = testMacro()
 	m.ID = ""
 	if err := m.Validate(); err == nil {
@@ -106,6 +128,32 @@ func TestStoreRoundTripAndApprove(t *testing.T) {
 	info, err := os.Stat(filepath.Join(dir, "test-site-flow.json"))
 	if err != nil || info.Mode().Perm() != 0o600 {
 		t.Fatalf("macro file mode: %v", info.Mode())
+	}
+}
+
+func TestApproveRequiresSecretRefs(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := testMacro()
+	m.Steps[1].Secret = "" // fresh recording: value redacted, ref not yet attached
+	if err := s.Put(m, false); err != nil {
+		t.Fatalf("draft put with pending secret: %v", err)
+	}
+	if err := s.Approve(m.ID, "ed"); err == nil {
+		t.Fatal("approving a macro whose type step lacks a secret ref must fail")
+	}
+	got, _ := s.Get(m.ID)
+	if got.Approved != nil {
+		t.Fatal("failed approval must not mark the macro approved")
+	}
+	if err := s.Update(m.ID, func(mm *Macro) { mm.Steps[1].Secret = "op://fin-browser/TireRack/password" }); err != nil {
+		t.Fatalf("attach ref: %v", err)
+	}
+	if err := s.Approve(m.ID, "ed"); err != nil {
+		t.Fatalf("approve after ref attached: %v", err)
 	}
 }
 
