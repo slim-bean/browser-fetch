@@ -405,12 +405,16 @@ type ClickAction struct {
 
 func (ClickAction) Kind() string { return "click" }
 
-// TypeAction types text into the focused element. Field classifies the input:
-// "password" requires a fresh passing assertion; "text" does not.
+// TypeAction types text into the focused element, or into Target when set.
+// Field classifies the input: "password" requires a fresh passing assertion;
+// "text" does not.
 type TypeAction struct {
 	Text   string `json:"text"`
 	Field  string `json:"field"`            // "text" | "password"
 	Submit bool   `json:"submit,omitempty"` // press Enter after
+	// Target, when set, is the selector to type into directly. Replay sets it
+	// from the step's recorded element; the raw :focus path is the fallback.
+	Target string `json:"target,omitempty"`
 }
 
 func (TypeAction) Kind() string { return "type" }
@@ -652,6 +656,13 @@ func (m *Manager) dispatchType(ctx context.Context, s *Session, a TypeAction) er
 	}
 	if a.Text == "" {
 		return errors.New("empty text")
+	}
+	// Type into the recorded target when we have one: querying ":focus" via
+	// SendKeys can stall on pages that re-focus or manage focus handlers
+	// (observed as a 30s NodeVisible deadline on tirerack.com). A direct
+	// selector query + KeyEventNode skips that re-focus round trip.
+	if a.Target != "" {
+		return runOn(ctx, chromedp.SendKeys(a.Target, a.Text, bySearchIfXPath(a.Target), chromedp.NodeVisible))
 	}
 	if err := runOn(ctx, chromedp.SendKeys(":focus", a.Text)); err != nil {
 		return err

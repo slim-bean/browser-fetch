@@ -272,6 +272,13 @@ func (r *Replayer) runType(ctx context.Context, exec Executor, sess *session.Ses
 		return &ReplayError{Step: i, Kind: "type", Cause: "secret resolve failed: " + err.Error()}
 	}
 	a.Text = value
+	// Type into the recorded element directly when a candidate exists: typing
+	// via ":focus" stalls on pages with focus handlers (30s NodeVisible
+	// deadline), while the click path already proves the selector works.
+	if a.Target == "" && step.Recorded != nil && step.Recorded.Element != nil &&
+		len(step.Recorded.Element.Candidates) > 0 {
+		a.Target = step.Recorded.Element.Candidates[0]
+	}
 	if _, err := exec.Run(ctx, sess, a); err != nil {
 		return &ReplayError{Step: i, Kind: "type", Cause: err.Error()}
 	}
