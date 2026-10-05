@@ -31,6 +31,14 @@ Chrome lifecycle/profile ownership is external (launcher, Kubernetes, pi-assista
   Validate changes/integrity, clean up on failure, surface unreadable/capped data.
   No caller paths, SQL, process commands, query-language parsing, ranking or formatting.
   `docs/history.md` specifies protocol v2. No Node/helper or pi repository build pin.
+- `internal/screenshot`: protocol v1 (`docs/screenshots.md`), fixed bounded source
+  clip before CDP capture, crop before scale, capped tiles/count/storage, memory-only
+  immutable captures. `/fetch/screenshot` accepts reader/driver/root but scopes IDs
+  to the creating credential class (root cannot read reader captures). Missing,
+  expired and wrong-scope IDs share a non-disclosing error; never auto-recapture.
+  Initial screenshots stay in the fetch worker lease; clear viewport emulation
+  before reuse. Dedupe must distinguish text/visual, visual ownership and assist.
+  Never log/store image bytes in debug/evidence. Media-blocked capture fails explicitly.
 - Fetch URL guards and scheduler defaults stay enabled. Test fixtures can opt into
   private targets; production assistant launch must not. CDP/history grants remain
   explicit and separate from those safeguards.
@@ -42,4 +50,8 @@ Run gofmt, `go test -race ./...`, `go vet ./...`, and
 `CGO_ENABLED=0 go build -o bin/browser-fetch .` (ignored). Preserve the full session/
 macro regression suite. `../pi-assistant/test/live.ts` covers shared cookies, clients,
 restart, native history and desktop focus with an isolated synthetic profile. Never
-use personal histories or logged-in finance accounts in tests.
+use personal histories or logged-in finance accounts in tests. The opt-in
+`TestLivePaginatedScreenshots` uses `BROWSER_FETCH_TEST_CHROME_URL` with a synthetic
+page. Adjacent pi-search's `npm run test:live:screenshot` provides an isolated
+headless browser/gateway and exercises both repositories without pi sessions,
+model calls or user auth-file access.

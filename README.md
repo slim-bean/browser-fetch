@@ -1,8 +1,8 @@
 # browser-fetch
 
-Renders web pages with a **real Chrome** and serves the rendered HTML over a
-small authenticated HTTP API, so automated clients can read sites that block
-non-browser HTTP clients.
+Renders web pages with a **real Chrome** and serves rendered HTML and optional
+paginated visual snapshots over a small authenticated HTTP API, so clients can
+read and inspect sites that block non-browser HTTP clients.
 
 Any client can use it. It is also the `browser` reader proxy for
 [pi-search](https://github.com/slim-bean/pi-search)'s `web_fetch` tool.
@@ -46,6 +46,7 @@ default browser context share cookies, so trust earned in one benefits all.
 | `internal/server` | HTTP API, auth, request logging, `/debug`, metrics |
 | `internal/reqlog` | bounded ring of recent requests for `/debug` |
 | `internal/history` | native, bounded Chromium history records from private database snapshots |
+| `internal/screenshot` | bounded image cropping/encoding and ephemeral, credential-scoped captures |
 | `internal/session`, `internal/macro` | typed sessions and approved deterministic macro replay |
 
 ## Deployment options
@@ -88,7 +89,8 @@ For a persistent setup see `deploy/systemd/browser-fetch.service`.
 
 | Route | Auth | Purpose |
 |---|---|---|
-| `POST /fetch` | yes | `{"url":…, "timeout_ms":…, "assist_ms":…}` → `{url,title,html,status,page_id,…}` |
+| `POST /fetch` | yes | `{"url":…, "timeout_ms":…, "assist_ms":…, "screenshot":true?}` → `{url,title,html,status,page_id,…,screenshot?}` |
+| `POST /fetch/screenshot` | yes | `{"capture_id":…, "segment":2}` → frozen image segment; never navigates |
 | `GET /fetch?url=…` | yes | same, convenient for `curl` |
 | `GET /healthz` | no | Chrome connectivity, version, tab pool, pending assists |
 | `GET /stats` | yes | scheduler snapshot: queue, per-host cooldowns, totals |
@@ -109,6 +111,23 @@ For a persistent setup see `deploy/systemd/browser-fetch.service`.
 | `POST /macro/approve` | driver | mark a reviewed macro replayable |
 | `POST /macro/replay` | driver | run an approved macro in a session |
 | `POST /macro/resume` | driver | signal a paused replay to continue |
+
+### Paginated screenshots
+
+Add `"screenshot":true` to a `/fetch` request to receive HTML and the first image
+segment from the same worker lease. `/fetch/screenshot` retrieves more using the
+same credential class. Captures expire after 10 minutes or restart; retrieval
+never silently recaptures. Root/driver/reader can all create captures, but cannot
+read each other's capture IDs. No sessions or root-only CDP access are needed.
+
+The gateway uses a fixed 1280 × 900 CSS-pixel viewport, captures at device scale 1
+up to 12,000 pixels tall, and crops before scaling: each JPEG is at most
+1280 × 1400 pixels / 384 KiB, with 100-pixel overlap and at most 10 segments.
+Clipped height/horizontal overflow is explicit. A memory-only store retains at most
+32 captures / 64 MiB, and capture/processing concurrency is limited to two.
+`-block-media` must be off. No gallery clicks, auto-scrolling or promise that
+lazy/virtualized content was loaded. See [`docs/screenshots.md`](docs/screenshots.md)
+for protocol v1, limits, ownership and examples.
 
 ### Session actions
 
@@ -152,7 +171,7 @@ The root token ( `-token` ) grants everything. Two optional extra tokens
 narrow what a caller can do:
 
 - `-driver-token` — sessions and fetch. This is what the finance flow engine uses.
-- `-reader-token` — `/fetch` only; can never open a session.
+- `-reader-token` — `/fetch` and frozen `/fetch/screenshot` segments only; can never open a session.
 
 CDP, history, runtime inspection and authenticated admin/debug routes require the
 root token. Public health/optionally-public metrics are unchanged. Session/macro
@@ -313,7 +332,13 @@ at an **isolated test Chrome**, never a personal/active profile. It exercises id
 and in-flight worker disconnections, caller cancellation, and recovery without
 navigation replay. `TestZZLiveWorkerContext` similarly requires the explicit
 `BROWSER_FETCH_TEST_CHROME_URL` and uses a synthetic page, not a public website.
-`../pi-assistant/test/live.ts` supplies its temporary browser for both tests
+`TestLivePaginatedScreenshots` uses `BROWSER_FETCH_TEST_CHROME_URL` for an opt-in
+synthetic end-to-end screenshot/continuation test. `../pi-search`'s
+`npm run test:live:screenshot` launches an isolated Chrome and gateway, exercises
+the registered pi-search tools, and runs that Go test without model calls or user
+auth access.
+
+`../pi-assistant/test/live.ts` supplies its temporary browser for both recovery tests
 alongside full gateway/browser lifecycle checks.
 
 `internal/challenge/testdata/` holds two real captured pages, with origins

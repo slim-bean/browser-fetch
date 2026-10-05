@@ -23,8 +23,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/chromedp/cdproto/emulation"
 	"github.com/chromedp/cdproto/network"
 	"github.com/chromedp/chromedp"
+	"github.com/slim-bean/browser-fetch/internal/screenshot"
 )
 
 type Options struct {
@@ -57,11 +59,12 @@ type Manager struct {
 	wsURL  string
 	closed bool
 
-	mu        sync.Mutex
-	connected bool
-	version   string
-	lastErr   string
-	assists   map[int]*Assist
+	mu           sync.Mutex
+	connected    bool
+	version      string
+	lastErr      string
+	assists      map[int]*Assist
+	captureSlots chan struct{} // bound bitmap capture/processing across workers
 }
 
 // Assist records a challenge waiting for a human at the VM's screen.
@@ -76,7 +79,8 @@ type Assist struct {
 type Request struct {
 	URL string
 	// Assist overrides the configured assist timeout for this request.
-	Assist *time.Duration
+	Assist     *time.Duration
+	Screenshot bool
 }
 
 // Result is a successfully rendered page.
@@ -90,7 +94,8 @@ type Result struct {
 	// Attempts is how many navigations it took (>1 means a challenge retry).
 	Attempts int `json:"attempts,omitempty"`
 	// AssistedMS is how long a human took to clear a challenge, if any.
-	AssistedMS int64 `json:"assisted_ms,omitempty"`
+	AssistedMS int64               `json:"assisted_ms,omitempty"`
+	Screenshot *screenshot.Capture `json:"-"`
 }
 
 // ChallengeError means the page never resolved into real content.
@@ -116,12 +121,13 @@ func New(ctx context.Context, o Options) *Manager {
 	}
 	allocCtx, stop := chromedp.NewRemoteAllocator(ctx, o.ChromeURL)
 	m := &Manager{
-		opts:    o,
-		log:     o.Logger,
-		root:    ctx,
-		alloc:   allocCtx,
-		stop:    stop,
-		assists: make(map[int]*Assist),
+		opts:         o,
+		log:          o.Logger,
+		root:         ctx,
+		alloc:        allocCtx,
+		stop:         stop,
+		assists:      make(map[int]*Assist),
+		captureSlots: make(chan struct{}, 2),
 	}
 	m.pool = newPool(m, allocCtx, o.MaxTabs)
 	return m
@@ -248,6 +254,17 @@ func (m *Manager) Health() Health {
 // Fetch renders one URL. Pacing and deduplication are the scheduler's job;
 // this function assumes it may navigate immediately.
 func (m *Manager) Fetch(ctx context.Context, req Request) (*Result, error) {
+	if req.Screenshot {
+		if m.opts.BlockMedia {
+			return nil, errors.New("screenshots require -block-media=false")
+		}
+		select {
+		case m.captureSlots <- struct{}{}:
+			defer func() { <-m.captureSlots }()
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	pool, err := m.currentPool(ctx)
 	if err != nil {
 		return nil, &NavError{Err: err}
@@ -268,6 +285,22 @@ func (m *Manager) Fetch(ctx context.Context, req Request) (*Result, error) {
 	defer cancelNav()
 	unwatch := watch(ctx, cancelNav)
 	defer unwatch()
+
+	if req.Screenshot {
+		defer func() {
+			// Also reset if setting emulation was cancelled after Chrome applied
+			// it. Cleanup uses worker lifetime, not the cancelled caller context.
+			resetCtx, cancel := context.WithTimeout(p.ctx, 2*time.Second)
+			defer cancel()
+			if err := chromedp.Run(resetCtx, emulation.ClearDeviceMetricsOverride()); err != nil {
+				healthy = false
+			}
+		}()
+		if err := chromedp.Run(navCtx, emulation.SetDeviceMetricsOverride(screenshot.Width, screenshot.ViewportHeight, 1, false)); err != nil {
+			healthy = !isFatalTabErr(p.ctx, err)
+			return nil, err
+		}
+	}
 
 	attempts := m.opts.ChallengeRetries + 1
 	var lastErr error
@@ -295,6 +328,13 @@ func (m *Manager) Fetch(ctx context.Context, req Request) (*Result, error) {
 
 		res, err := m.settle(ctx, p, req, log)
 		if err == nil {
+			if req.Screenshot {
+				res.Screenshot, err = m.capture(ctx, p, res)
+				if err != nil {
+					healthy = !isFatalTabErr(p.ctx, err)
+					return nil, err
+				}
+			}
 			res.PageID = p.id
 			res.Attempts = attempt
 			return res, nil

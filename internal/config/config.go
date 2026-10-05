@@ -29,7 +29,7 @@ type Config struct {
 	// DriverToken grants sessions/macros and fetch, not root-only CDP/history/admin.
 	// Empty = root Token holders only.
 	DriverToken string
-	// ReaderToken is a restricted token: /fetch only, never sessions. Empty =
+	// ReaderToken grants /fetch and frozen /fetch/screenshot retrieval, never sessions. Empty =
 	// no separate reader class.
 	ReaderToken string
 
@@ -192,7 +192,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&c.Addr, "addr", c.Addr, "listen address")
 	fs.StringVar(&c.Token, "token", c.Token, "bearer token for /fetch, /stats, /debug")
 	fs.StringVar(&c.DriverToken, "driver-token", c.DriverToken, "extra token allowed to drive sessions")
-	fs.StringVar(&c.ReaderToken, "reader-token", c.ReaderToken, "restricted token: /fetch only, no sessions")
+	fs.StringVar(&c.ReaderToken, "reader-token", c.ReaderToken, "restricted token: /fetch and screenshot segments only, no sessions")
 	fs.Var(&hostList{&c.AllowHosts}, "allow-hosts", "comma-separated hosts sessions may navigate to")
 	fs.StringVar(&c.MacroStore, "macro-store", c.MacroStore, "directory for macro recordings (empty disables macro endpoints)")
 	fs.StringVar(&c.AdminAddr, "admin-addr", c.AdminAddr, "listen address for the human-only macro admin band (empty disables)")

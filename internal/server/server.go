@@ -39,6 +39,7 @@ import (
 	"github.com/slim-bean/browser-fetch/internal/metrics"
 	"github.com/slim-bean/browser-fetch/internal/reqlog"
 	"github.com/slim-bean/browser-fetch/internal/scheduler"
+	"github.com/slim-bean/browser-fetch/internal/screenshot"
 	"github.com/slim-bean/browser-fetch/internal/session"
 	"github.com/slim-bean/browser-fetch/internal/urlguard"
 )
@@ -57,6 +58,7 @@ type Server struct {
 	secrets      macro.SecretResolver
 	start        time.Time
 	historySlots chan struct{}
+	screenshots  *screenshot.Store
 }
 
 func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
@@ -68,6 +70,7 @@ func New(cfg config.Config, log *slog.Logger, mgr *browser.Manager) *Server {
 		ring:         reqlog.NewRing(cfg.DebugRing),
 		start:        time.Now(),
 		historySlots: make(chan struct{}, 2),
+		screenshots:  screenshot.NewStore(),
 		sched: scheduler.New[*browser.Result](scheduler.Options{
 			MaxSlots: cfg.MaxTabs,
 			HostGap:  cfg.HostGap,
@@ -121,6 +124,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.Handle("POST /fetch", s.route("fetch", true, s.handleFetch))
 	mux.Handle("GET /fetch", s.route("fetch", true, s.handleFetch))
+	mux.Handle("POST /fetch/screenshot", s.routeClass("fetch_screenshot", classReader, s.handleScreenshot))
 	mux.Handle("GET /healthz", s.route("healthz", false, s.handleHealth))
 	mux.Handle("GET /stats", s.route("stats", true, s.handleStats))
 	mux.Handle("POST /history/query", s.route("history", true, s.handleHistory))
@@ -143,8 +147,9 @@ func (s *Server) Handler() http.Handler {
 	mux.Handle("GET /runtime", s.route("runtime", true, func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"service": "browser-fetch", "pid": os.Getpid(), "chrome_url": s.cfg.ChromeURL,
-			"capabilities":    map[string]bool{"cdp": s.cfg.EnableCDP, "history": s.cfg.HistoryRoot != ""},
-			"historyProtocol": history.Version,
+			"capabilities":       map[string]bool{"cdp": s.cfg.EnableCDP, "history": s.cfg.HistoryRoot != "", "screenshots": true},
+			"screenshotProtocol": screenshot.Version,
+			"historyProtocol":    history.Version,
 		})
 	}))
 	mux.Handle("POST /session/open", s.routeDriver("session_open", s.handleSessionOpen))
@@ -242,7 +247,7 @@ type tokenClass int
 
 const (
 	classNone   tokenClass = iota
-	classReader            // ReaderToken: /fetch only, never sessions
+	classReader            // ReaderToken: /fetch + frozen segments, never sessions
 	classDriver            // DriverToken: sessions + fetch
 	classFull              // Token: everything
 )
@@ -328,6 +333,7 @@ func (s *Server) sessionsReaper() {
 	defer t.Stop()
 	for range t.C {
 		s.sessions.Reap()
+		s.screenshots.Reap()
 	}
 }
 

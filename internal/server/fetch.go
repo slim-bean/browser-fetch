@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -15,25 +17,28 @@ import (
 	"github.com/slim-bean/browser-fetch/internal/logx"
 	"github.com/slim-bean/browser-fetch/internal/metrics"
 	"github.com/slim-bean/browser-fetch/internal/reqlog"
+	"github.com/slim-bean/browser-fetch/internal/screenshot"
 )
 
 type fetchRequest struct {
-	URL       string `json:"url"`
-	TimeoutMS int    `json:"timeout_ms,omitempty"`
-	AssistMS  *int   `json:"assist_ms,omitempty"`
+	URL        string `json:"url"`
+	TimeoutMS  int    `json:"timeout_ms,omitempty"`
+	AssistMS   *int   `json:"assist_ms,omitempty"`
+	Screenshot bool   `json:"screenshot,omitempty"`
 }
 
 type fetchResponse struct {
-	URL         string `json:"url"`
-	Title       string `json:"title"`
-	HTML        string `json:"html"`
-	Status      int    `json:"status"`
-	PageID      int    `json:"page_id"`
-	AssistedMS  int64  `json:"assisted_ms,omitempty"`
-	RequestID   string `json:"request_id"`
-	DurationMS  int64  `json:"duration_ms"`
-	QueueWaitMS int64  `json:"queue_wait_ms"`
-	Deduped     bool   `json:"deduped"`
+	URL         string              `json:"url"`
+	Title       string              `json:"title"`
+	HTML        string              `json:"html"`
+	Status      int                 `json:"status"`
+	PageID      int                 `json:"page_id"`
+	AssistedMS  int64               `json:"assisted_ms,omitempty"`
+	RequestID   string              `json:"request_id"`
+	DurationMS  int64               `json:"duration_ms"`
+	QueueWaitMS int64               `json:"queue_wait_ms"`
+	Deduped     bool                `json:"deduped"`
+	Screenshot  *screenshot.Segment `json:"screenshot,omitempty"`
 }
 
 func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +55,10 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 			Error: err.Error(), Code: metrics.OutcomeBadRequest, RequestID: reqID,
 		})
 		return
+	}
+
+	if req.Screenshot {
+		w.Header().Set("Cache-Control", "no-store")
 	}
 
 	// Validate and resolve before a browser ever sees the URL.
@@ -82,11 +91,17 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	// Queue wait is measured from handler entry to the moment the navigation
 	// actually starts, so /debug shows pacing separately from page load time.
 	var queueWait time.Duration
-	res, shared, err := s.sched.Do(ctx, host, u.String(), func(ctx context.Context) (*browser.Result, error) {
+	// Visual and text requests cannot dedupe together. Credential classes must
+	// not share captures; assist policy is also part of the work identity.
+	key := fmt.Sprintf("%s|screenshot=%t|assist=%v", u.String(), req.Screenshot, assist)
+	if req.Screenshot {
+		key += fmt.Sprintf("|owner=%d", s.tokenClass(r))
+	}
+	res, shared, err := s.sched.Do(ctx, host, key, func(ctx context.Context) (*browser.Result, error) {
 		queueWait = time.Since(started)
 		s.met.QueueWait.Observe(queueWait.Seconds())
 		log.Info("navigating", "host", host, "queue_wait", queueWait.Round(time.Millisecond))
-		return s.mgr.Fetch(ctx, browser.Request{URL: u.String(), Assist: assist})
+		return s.mgr.Fetch(ctx, browser.Request{URL: u.String(), Assist: assist, Screenshot: req.Screenshot})
 	})
 
 	entry := reqlog.Entry{
@@ -107,6 +122,15 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	var shot *screenshot.Segment
+	if req.Screenshot {
+		shot, err = s.screenshots.Add(s.screenshotOwner(r), res.URL, res.Title, res.Screenshot)
+		if err != nil {
+			entry.Outcome, entry.Error = "screenshot_capacity", err.Error()
+			s.finishFetch(w, log, entry, started, http.StatusServiceUnavailable, errorBody{Error: err.Error(), Code: entry.Outcome, RequestID: reqID})
+			return
+		}
+	}
 	entry.Outcome = metrics.OutcomeOK
 	entry.FinalURL = res.URL
 	entry.Status = res.Status
@@ -119,7 +143,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 		URL: res.URL, Title: res.Title, HTML: res.HTML, Status: res.Status,
 		PageID: res.PageID, AssistedMS: res.AssistedMS, RequestID: reqID,
 		DurationMS: time.Since(started).Milliseconds(), QueueWaitMS: queueWait.Milliseconds(),
-		Deduped: shared,
+		Deduped: shared, Screenshot: shot,
 	})
 }
 
@@ -155,6 +179,9 @@ func parseFetchRequest(r *http.Request) (fetchRequest, error) {
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&req); err != nil {
 		return req, errors.New("invalid JSON body: " + err.Error())
+	}
+	if err := dec.Decode(new(any)); err != io.EOF {
+		return req, errors.New("body must contain exactly one JSON object")
 	}
 	if strings.TrimSpace(req.URL) == "" {
 		return req, errors.New("body field \"url\" is required")
