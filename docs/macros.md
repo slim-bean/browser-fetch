@@ -62,7 +62,12 @@ Approval authority lives on a **separate admin band** the agent cannot reach:
 
 Key properties:
 - **Secrets by reference only.** `secret` is an `op://` URI resolved at replay
-  time via 1Password; the macro file and evidence log never contain values.
+  time via 1Password (service account token in `BROWSER_FETCH_OP_TOKEN`, mounted
+  from a Kubernetes Secret into the gateway pod only); the macro file and
+  evidence log never contain values. A fresh recording has no ref yet — the
+  recorder redacts typed values in-browser — so drafts may hold a pending-secret
+  type step; approval is refused until the operator attaches the ref at the
+  admin band (`set_secret`, reference only).
 - **Element descriptors, not single selectors.** `candidates` is an ordered
   selector ladder recorded at capture time; replay tries them in order.
 - **autofill steps carry no secret and no value.** They name a selector and
@@ -151,8 +156,10 @@ What the grant never changes:
 
 Macro endpoints require `-macro-store DIR` / `BROWSER_FETCH_MACRO_STORE`
 (0600 files; macro store disabled when unset). Replay of `type` steps needs a
-secret resolver (1Password bridge, Phase 2); a macro with type steps aborts
-at that step with "no secret resolver configured" until then.
+secret resolver: the gateway builds the 1Password service-account bridge when
+`BROWSER_FETCH_OP_TOKEN` / `-op-token` is set (operator-mounted Kubernetes
+Secret, never the agent env); without it type steps abort with "no secret
+resolver configured" — fail-closed.
 
 ## Replay semantics (implemented)
 

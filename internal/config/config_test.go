@@ -76,3 +76,43 @@ func TestAdminBandConfigValidation(t *testing.T) {
 		t.Fatal("default config must not require the band", err)
 	}
 }
+
+// TestOpTokenConfig pins: the 1Password service account token loads from
+// BROWSER_FETCH_OP_TOKEN, defaults to absent (resolver-less, fail-closed),
+// and must differ from every gateway/admin token.
+func TestOpTokenConfig(t *testing.T) {
+	c := Default()
+	if c.OpServiceAccountToken != "" {
+		t.Fatal("op token must default to empty (resolver-less start)")
+	}
+	c = Default()
+	c.AllowNoToken = true
+	t.Setenv("BROWSER_FETCH_OP_TOKEN", "ops-token")
+	t.Setenv("BROWSER_FETCH_TOKEN", "agent")
+	got, err := Load(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.OpServiceAccountToken != "ops-token" {
+		t.Fatalf("BROWSER_FETCH_OP_TOKEN not loaded: %q", got.OpServiceAccountToken)
+	}
+	// Token reuse must be refused.
+	for _, reuse := range []string{"Token", "DriverToken", "ReaderToken", "AdminToken"} {
+		c2 := got
+		switch reuse {
+		case "Token":
+			c2.Token = "ops-token"
+		case "DriverToken":
+			c2.DriverToken = "ops-token"
+		case "ReaderToken":
+			c2.ReaderToken = "ops-token"
+		case "AdminToken":
+			c2.AdminAddr = ":8081"
+			c2.MacroStore = "/tmp/macros"
+			c2.AdminToken = "ops-token"
+		}
+		if err := c2.validate(); err == nil {
+			t.Fatalf("op token may not equal %s", reuse)
+		}
+	}
+}

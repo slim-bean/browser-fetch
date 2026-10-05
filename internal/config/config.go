@@ -105,6 +105,13 @@ type Config struct {
 	// authority, and it must be unreachable by the agent.
 	AdminToken string
 
+	// OpServiceAccountToken is the 1Password service account token used to
+	// resolve op:// secret references at replay time. Mounted from a
+	// Kubernetes Secret into the gateway pod only; it MUST NOT be set in any
+	// agent environment. Empty = no resolver: type steps abort at replay
+	// (fail-closed).
+	OpServiceAccountToken string
+
 	LogFormat string // text|json
 	LogLevel  string // debug|info|warn|error
 }
@@ -180,6 +187,7 @@ func Load(args []string) (Config, error) {
 	envStr("BROWSER_FETCH_MACRO_STORE", &c.MacroStore)
 	envStr("BROWSER_FETCH_ADMIN_ADDR", &c.AdminAddr)
 	envStr("BROWSER_FETCH_ADMIN_TOKEN", &c.AdminToken)
+	envStr("BROWSER_FETCH_OP_TOKEN", &c.OpServiceAccountToken)
 	envStr("BROWSER_FETCH_PUBLIC_URL", &c.PublicURL)
 	if err := envBool("BROWSER_FETCH_ENABLE_CDP", &c.EnableCDP); err != nil {
 		return c, err
@@ -197,6 +205,7 @@ func Load(args []string) (Config, error) {
 	fs.StringVar(&c.MacroStore, "macro-store", c.MacroStore, "directory for macro recordings (empty disables macro endpoints)")
 	fs.StringVar(&c.AdminAddr, "admin-addr", c.AdminAddr, "listen address for the human-only macro admin band (empty disables)")
 	fs.StringVar(&c.AdminToken, "admin-token", c.AdminToken, "bearer token for the admin band; must differ from agent tokens")
+	fs.StringVar(&c.OpServiceAccountToken, "op-token", c.OpServiceAccountToken, "1Password service account token for op:// secret resolution (empty disables; prefer the env var)")
 	fs.BoolVar(&c.AllowNoToken, "allow-no-token", c.AllowNoToken, "start without a token (local only)")
 	fs.StringVar(&c.ChromeURL, "chrome-url", c.ChromeURL, "Chrome DevTools endpoint")
 	fs.IntVar(&c.MaxTabs, "max-tabs", c.MaxTabs, "max concurrent navigations")
@@ -273,6 +282,13 @@ func (c Config) validate() error {
 		}
 		if c.AdminToken == c.Token || c.AdminToken == c.DriverToken || c.AdminToken == c.ReaderToken {
 			return errors.New("admin-token must differ from every agent-facing token")
+		}
+	}
+	if c.OpServiceAccountToken != "" {
+		for _, clash := range []string{c.Token, c.DriverToken, c.ReaderToken, c.AdminToken} {
+			if clash != "" && c.OpServiceAccountToken == clash {
+				return errors.New("op-token must differ from every gateway/admin token")
+			}
 		}
 	}
 	return nil
