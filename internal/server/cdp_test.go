@@ -1,8 +1,10 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -35,9 +37,14 @@ func TestCDPDiscoveryAndAuthenticatedWebSocket(t *testing.T) {
 			return
 		}
 		defer conn.Close()
-		data, op, err := wsutil.ReadClientData(conn)
-		if err == nil {
-			_ = wsutil.WriteServerMessage(conn, op, data)
+		for {
+			data, op, err := wsutil.ReadClientData(conn)
+			if err != nil {
+				return
+			}
+			if err := wsutil.WriteServerMessage(conn, op, data); err != nil {
+				return
+			}
 		}
 	}))
 	defer upstream.Close()
@@ -99,6 +106,36 @@ func TestCDPDiscoveryAndAuthenticatedWebSocket(t *testing.T) {
 	got, _, err := wsutil.ReadServerData(conn)
 	if err != nil || string(got) != string(payload) {
 		t.Fatalf("websocket round trip: %s %v", got, err)
+	}
+	// Exercise masking kernels on both sides of their block boundaries and
+	// extended payload lengths through the real HTTP-hijacking proxy path.
+	for _, size := range []int{0, 15, 16, 17, 125, 126, 65537} {
+		t.Run(fmt.Sprintf("binary-%d", size), func(t *testing.T) {
+			payload := bytes.Repeat([]byte{0x00, 0x80, 0xff, 0x42}, (size+3)/4)[:size]
+			if err := wsutil.WriteClientBinary(conn, payload); err != nil {
+				t.Fatal(err)
+			}
+			got, op, err := wsutil.ReadServerData(conn)
+			if err != nil || op != ws.OpBinary || !bytes.Equal(got, payload) {
+				t.Fatalf("binary echo: opcode=%v bytes=%d err=%v", op, len(got), err)
+			}
+		})
+	}
+	// A control frame between text fragments must not appear in the echoed
+	// message or disrupt the UTF-8 sequence split across fragment boundaries.
+	fragments := []ws.Frame{
+		ws.NewFrame(ws.OpText, false, []byte{'a', 0xe2}),
+		ws.NewPingFrame([]byte("probe")),
+		ws.NewFrame(ws.OpContinuation, true, []byte{0x82, 0xac, 'z'}),
+	}
+	for _, frame := range fragments {
+		if err := ws.WriteFrame(conn, ws.MaskFrameInPlace(frame)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, op, err := wsutil.ReadServerData(conn)
+	if err != nil || op != ws.OpText || string(got) != "a€z" {
+		t.Fatalf("fragmented echo: opcode=%v payload=%q err=%v", op, got, err)
 	}
 }
 
